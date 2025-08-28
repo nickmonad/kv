@@ -19,7 +19,7 @@ pub const BulkArray = struct {
     // encode
     // caller is responsible for freeing returned str
     pub fn encode(alloc: std.mem.Allocator, elements: []const []const u8) !Self {
-        var encoded = std.ArrayList([]const u8).init(alloc);
+        var encoded = try std.ArrayList([]const u8).initCapacity(alloc, elements.len + 1);
         defer encoded.deinit();
 
         const n = try std.fmt.allocPrint(alloc, "*{d}\r\n", .{elements.len});
@@ -31,8 +31,8 @@ pub const BulkArray = struct {
         }
 
         const str = try std.mem.concat(alloc, u8, encoded.items);
-        for (encoded.items) |e| {
-            alloc.free(e);
+        for (encoded.items) |item| {
+            alloc.free(item);
         }
 
         return .{ .str = str };

@@ -22,16 +22,16 @@ pub fn parse(alloc: std.mem.Allocator, buf: []const u8) !Command {
     var iter = try ParseIterator.init(alloc, buf);
     defer iter.deinit();
 
-    // check for command name as first element
-    // normalize to lowercase to check against enum
+    // command (first element)
     const cmd_parsed = p: {
         if (iter.next()) |parsed| {
             break :p parsed;
         }
 
-        return ParseError.MissingData;
+        return ParseError.UnknownCommand;
     };
 
+    // normalize to lower case to check against enum
     const lower = try std.ascii.allocLowerString(alloc, cmd_parsed);
     defer alloc.free(lower);
 
@@ -117,7 +117,7 @@ const ParseIterator = struct {
         }
 
         if (parsed.items.len != n) {
-            return ParseError.InvalidLength;
+            return ParseError.InvalidArrayFormat;
         }
 
         return Self{ .alloc = alloc, .parsed = parsed };
@@ -190,7 +190,7 @@ const ECHO = struct {
     const Self = @This();
 
     fn parse(iter: *ParseIterator) !Self {
-        const arg = iter.next().?;
+        const arg = iter.next() orelse return ParseError.MissingData;
         return .{ .arg = arg };
     }
 
@@ -208,14 +208,14 @@ const SET = struct {
     const Self = @This();
 
     fn parse(iter: *ParseIterator) !Self {
-        const key = iter.next().?;
-        const value = iter.next().?;
+        const key = iter.next() orelse return ParseError.MissingData;
+        const value = iter.next() orelse return ParseError.MissingData;
 
         // check for expiry value
         const px = iter.next();
         if (px) |_| {
             // expect "PX <expiry>"
-            const expires_str = iter.next().?;
+            const expires_str = iter.next() orelse return ParseError.MissingData;
             const expires = try std.fmt.parseInt(i64, expires_str, 10);
 
             return .{ .key = key, .value = value, .expires_in = expires };
@@ -236,7 +236,7 @@ const GET = struct {
     const Self = @This();
 
     fn parse(iter: *ParseIterator) !Self {
-        const key = iter.next().?;
+        const key = iter.next() orelse return ParseError.MissingData;
         return .{ .key = key };
     }
 
@@ -262,7 +262,7 @@ const PUSH = struct {
     const Direction = enum { left, right };
 
     fn parse(alloc: std.mem.Allocator, iter: *ParseIterator, direction: Direction) !Self {
-        const list = iter.next().?;
+        const list = iter.next() orelse return ParseError.MissingData;
         var elements = std.ArrayList([]const u8).init(alloc);
 
         while (iter.next()) |element| {
@@ -306,9 +306,9 @@ const LRANGE = struct {
     const Self = @This();
 
     fn parse(iter: *ParseIterator) !Self {
-        const list = iter.next().?;
-        const start = try std.fmt.parseInt(isize, iter.next().?, 10);
-        const stop = try std.fmt.parseInt(isize, iter.next().?, 10);
+        const list = iter.next() orelse return ParseError.MissingData;
+        const start = try std.fmt.parseInt(isize, iter.next() orelse return ParseError.MissingData, 10);
+        const stop = try std.fmt.parseInt(isize, iter.next() orelse return ParseError.MissingData, 10);
 
         return .{
             .list = list,
@@ -339,7 +339,7 @@ const LLEN = struct {
     const Self = @This();
 
     fn parse(iter: *ParseIterator) !Self {
-        const list = iter.next().?;
+        const list = iter.next() orelse return ParseError.MissingData;
         return .{ .list = list };
     }
 
@@ -356,7 +356,7 @@ const LPOP = struct {
     const Self = @This();
 
     fn parse(iter: *ParseIterator) !Self {
-        const key = iter.next().?;
+        const key = iter.next() orelse return ParseError.MissingData;
 
         if (iter.next()) |count| {
             const c = try std.fmt.parseInt(usize, count, 10);
@@ -403,10 +403,6 @@ const LPOP = struct {
 // Don't forget to free the returned .str
 fn BA(elements: []const []const u8) BulkArray {
     return BulkArray.encode(std.testing.allocator, elements) catch unreachable;
-}
-
-test {
-    // std.testing.refAllDecls(@This());
 }
 
 test "splitSequence sanity check" {
@@ -489,6 +485,15 @@ test "parse PING" {
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.ping);
 }
 
+test "parse ECHO error missing" {
+    const alloc = std.testing.allocator;
+
+    const cmd = BA(&.{"ECHO"});
+    defer alloc.free(cmd.str);
+
+    try std.testing.expectError(ParseError.MissingData, parse(alloc, cmd.str));
+}
+
 test "parse ECHO arg" {
     const alloc = std.testing.allocator;
 
@@ -498,6 +503,14 @@ test "parse ECHO arg" {
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.echo);
     try std.testing.expectEqualSlices(u8, "hello, zig", parsed.echo.arg);
+}
+
+test "parse SET error missing" {
+    const alloc = std.testing.allocator;
+
+    const cmd = BA(&.{ "SET", "test" });
+    defer alloc.free(cmd.str);
+    try std.testing.expectError(ParseError.MissingData, parse(alloc, cmd.str));
 }
 
 test "parse SET key value" {
