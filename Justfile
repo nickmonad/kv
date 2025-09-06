@@ -1,14 +1,18 @@
 flox:
     flox activate -- fish
 
-build:
+version:
+    #!/usr/bin/env bash
+    echo "zig $(zig version)"
+
+build: version
     zig build
+
+test: version
+    zig build test --summary all
 
 run:
     zig build run
-
-test:
-    zig build test --summary all
 
 test-cli:
     @rm -f test.cli.out

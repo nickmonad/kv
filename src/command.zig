@@ -20,7 +20,7 @@ const ParseError = error{
 // It seems like it should be the "inline command" format (not RESP): https://redis.io/docs/latest/develop/reference/protocol-spec/#inline-commands
 pub fn parse(alloc: std.mem.Allocator, buf: []const u8) !Command {
     var iter = try ParseIterator.init(alloc, buf);
-    defer iter.deinit();
+    defer iter.deinit(alloc);
 
     // command (first element)
     const cmd_parsed = p: {
@@ -55,7 +55,6 @@ pub fn parse(alloc: std.mem.Allocator, buf: []const u8) !Command {
 const ParseIterator = struct {
     const Self = @This();
 
-    alloc: std.mem.Allocator,
     parsed: std.ArrayList([]const u8),
     index: usize = 0,
 
@@ -66,8 +65,8 @@ const ParseIterator = struct {
         // "parsed" items
         // gather up every bulk string within the array, validating the $<length> component
         // (but not storing them)
-        var parsed = std.ArrayList([]const u8).init(alloc);
-        errdefer parsed.deinit();
+        var parsed: std.ArrayList([]const u8) = .empty;
+        errdefer parsed.deinit(alloc);
 
         // parse size (n) of bulk string array
         const n_slice = iter.first();
@@ -113,18 +112,18 @@ const ParseIterator = struct {
             }
 
             // all good
-            try parsed.append(data);
+            try parsed.append(alloc, data);
         }
 
         if (parsed.items.len != n) {
             return ParseError.InvalidArrayFormat;
         }
 
-        return Self{ .alloc = alloc, .parsed = parsed };
+        return Self{ .parsed = parsed };
     }
 
-    fn deinit(self: *Self) void {
-        self.parsed.deinit();
+    fn deinit(self: *Self, alloc: std.mem.Allocator) void {
+        self.parsed.deinit(alloc);
     }
 
     fn next(self: *Self) ?[]const u8 {
@@ -162,14 +161,16 @@ const Command = union(CommandName) {
     llen: LLEN,
     lpop: LPOP,
 
-    pub fn do(self: Command, alloc: std.mem.Allocator, kv: *Store) !?[]const u8 {
-        switch (self) {
+    const Self = @This();
+
+    pub fn do(self: *Self, alloc: std.mem.Allocator, kv: *Store) !?[]const u8 {
+        switch (self.*) {
             .ping => |ping| return ping.do(),
             .echo => |echo| return echo.do(alloc),
             .set => |set| return set.do(kv),
             .get => |get| return get.do(alloc, kv),
-            .rpush, .lpush => |push| {
-                defer push.deinit();
+            .rpush, .lpush => |*push| {
+                defer push.deinit(alloc);
                 return push.do(alloc, kv);
             },
             .lrange => |lrange| return lrange.do(alloc, kv),
@@ -263,10 +264,10 @@ const PUSH = struct {
 
     fn parse(alloc: std.mem.Allocator, iter: *ParseIterator, direction: Direction) !Self {
         const list = iter.next() orelse return ParseError.MissingData;
-        var elements = std.ArrayList([]const u8).init(alloc);
+        var elements: std.ArrayList([]const u8) = .empty;
 
         while (iter.next()) |element| {
-            try elements.append(element);
+            try elements.append(alloc, element);
         }
 
         return .{ .list = list, .elements = elements, .direction = direction };
@@ -293,8 +294,8 @@ const PUSH = struct {
         return try std.fmt.allocPrint(alloc, ":{d}\r\n", .{length}); // TODO: abstract this out to RESP Int type
     }
 
-    fn deinit(self: Self) void {
-        self.elements.deinit();
+    fn deinit(self: *Self, alloc: std.mem.Allocator) void {
+        self.elements.deinit(alloc);
     }
 };
 
@@ -319,13 +320,13 @@ const LRANGE = struct {
 
     fn do(self: Self, alloc: std.mem.Allocator, kv: *Store) !?[]const u8 {
         var list = try kv.lrange(alloc, self.list, self.start, self.stop);
-        defer list.deinit();
+        defer list.deinit(alloc);
 
-        var to_encode = std.ArrayList([]const u8).init(alloc);
-        defer to_encode.deinit();
+        var to_encode: std.ArrayList([]const u8) = .empty;
+        defer to_encode.deinit(alloc);
 
         for (list.list.items) |item| {
-            try to_encode.append(item.value);
+            try to_encode.append(alloc, item.value);
         }
 
         const encoded = try BulkArray.encode(alloc, to_encode.items);
@@ -368,7 +369,7 @@ const LPOP = struct {
 
     fn do(self: Self, alloc: std.mem.Allocator, kv: *Store) !?[]const u8 {
         var list = try kv.lpop(alloc, self.key, self.count) orelse return NULL;
-        defer list.deinit();
+        defer list.deinit(alloc);
 
         if (list.list.items.len == 0) {
             const encoded = try BulkString.encode(alloc, "");
@@ -383,11 +384,11 @@ const LPOP = struct {
         }
 
         // multiple elements
-        var to_encode = std.ArrayList([]const u8).init(alloc);
-        defer to_encode.deinit();
+        var to_encode: std.ArrayList([]const u8) = .empty;
+        defer to_encode.deinit(alloc);
 
         for (list.list.items) |item| {
-            try to_encode.append(item.value);
+            try to_encode.append(alloc, item.value);
         }
 
         const encoded = try BulkArray.encode(alloc, to_encode.items);
@@ -422,7 +423,7 @@ test "splitSequence sanity check" {
 test "ParseIterator" {
     const alloc = std.testing.allocator;
     var iter = try ParseIterator.init(alloc, "*1\r\n$4\r\nPING\r\n");
-    defer iter.deinit();
+    defer iter.deinit(alloc);
 
     try std.testing.expectEqualSlices(u8, "PING", iter.next().?);
     try std.testing.expectEqual(null, iter.next());
@@ -431,7 +432,7 @@ test "ParseIterator" {
 test "ParseIterator termination" {
     const alloc = std.testing.allocator;
     var iter = try ParseIterator.init(alloc, "*1\r\n$4\r\nPING\r\n");
-    defer iter.deinit();
+    defer iter.deinit(alloc);
 
     try std.testing.expectEqualSlices(u8, "PING", iter.next().?);
 
@@ -448,7 +449,7 @@ test "ParseIterator multiple elements" {
     defer alloc.free(cmd.str);
 
     var iter = try ParseIterator.init(alloc, cmd.str);
-    defer iter.deinit();
+    defer iter.deinit(alloc);
 
     try std.testing.expectEqualSlices(u8, "SET", iter.next().?);
     try std.testing.expectEqualSlices(u8, "test", iter.next().?);
@@ -554,8 +555,8 @@ test "parse RPUSH, 1 element" {
 
     const cmd = BA(&.{ "RPUSH", "test", "zig" });
     defer alloc.free(cmd.str);
-    const parsed = try parse(alloc, cmd.str);
-    defer parsed.rpush.deinit();
+    var parsed = try parse(alloc, cmd.str);
+    defer parsed.rpush.deinit(alloc);
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.rpush);
     try std.testing.expectEqualSlices(u8, "test", parsed.rpush.list);
@@ -569,8 +570,8 @@ test "parse RPUSH, mulitple elements" {
 
     const ba = BA(&.{ "RPUSH", "test", "zig", "cool" });
     defer alloc.free(ba.str);
-    const cmd = try parse(alloc, ba.str);
-    defer cmd.rpush.deinit();
+    var cmd = try parse(alloc, ba.str);
+    defer cmd.rpush.deinit(alloc);
 
     try std.testing.expect(std.meta.activeTag(cmd) == CommandName.rpush);
     try std.testing.expectEqualSlices(u8, "test", cmd.rpush.list);
@@ -585,8 +586,8 @@ test "parse LPUSH, 1 element" {
 
     const cmd = BA(&.{ "LPUSH", "test", "zig" });
     defer alloc.free(cmd.str);
-    const parsed = try parse(alloc, cmd.str);
-    defer parsed.lpush.deinit();
+    var parsed = try parse(alloc, cmd.str);
+    defer parsed.lpush.deinit(alloc);
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lpush);
     try std.testing.expectEqualSlices(u8, "test", parsed.lpush.list);

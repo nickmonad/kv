@@ -49,7 +49,7 @@ fn handle_connection(conn: std.net.Server.Connection, kv: *Store) !void {
             break; // closed by client
         }
 
-        const cmd = try command.parse(alloc, request[0..n]);
+        var cmd = try command.parse(alloc, request[0..n]);
         const resp = try cmd.do(alloc, kv);
         if (resp) |r| {
             try conn.stream.writeAll(r);

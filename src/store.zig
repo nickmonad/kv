@@ -14,28 +14,31 @@ pub const String = struct {
 };
 
 pub const List = struct {
-    pub const Node = std.DoublyLinkedList(String).Node;
-    value: std.DoublyLinkedList(String),
+    list: std.DoublyLinkedList,
+};
+
+pub const ListItem = struct {
+    node: std.DoublyLinkedList.Node,
+    data: String,
 };
 
 const PushDirection = enum { left, right };
 
 pub const AllocatedList = struct {
-    alloc: std.mem.Allocator,
     list: std.ArrayList(String),
 
     const Self = @This();
 
-    fn init(alloc: std.mem.Allocator) Self {
-        return .{ .alloc = alloc, .list = std.ArrayList(String).init(alloc) };
+    fn init() Self {
+        return .{ .list = .empty };
     }
 
-    pub fn deinit(self: *Self) void {
+    pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
         for (self.list.items) |item| {
-            self.alloc.free(item.value);
+            alloc.free(item.value);
         }
 
-        self.list.deinit();
+        self.list.deinit(alloc);
     }
 };
 
@@ -140,36 +143,39 @@ pub const Store = struct {
         defer self.rw.unlock();
 
         const exists = self.map.getPtr(key);
-        if (exists) |list| {
-            assert(std.meta.activeTag(list.*) == .list);
+        if (exists) |entry| {
+            assert(std.meta.activeTag(entry.*) == .list);
+
             // copy element
             const e = try self.alloc.dupe(u8, element);
-            // append to existing list
-            var node = try self.alloc.create(List.Node);
-            node.data = .{ .value = e, .expires_at = null };
+
+            // create new list item
+            var item = try self.alloc.create(ListItem);
+            item.data = .{ .value = e, .expires_at = null };
 
             switch (direction) {
-                .left => list.*.list.value.prepend(node),
-                .right => list.*.list.value.append(node),
+                .left => entry.list.list.prepend(&item.node),
+                .right => entry.list.list.append(&item.node),
             }
 
-            return list.*.list.value.len;
+            // TODO: this is horribly inefficient, we should keep track of the length
+            return entry.*.list.list.len();
         }
 
+        // list does not exist
         // copy key and element... see note in `set()` for why
         const k = try self.alloc.dupe(u8, key);
         const e = try self.alloc.dupe(u8, element);
 
-        // list does not exist.
-        // create node
-        var node = try self.alloc.create(List.Node);
-        node.data = .{ .value = e, .expires_at = null };
+        // create new list
+        var list: std.DoublyLinkedList = .{};
 
-        // and list
-        var list = std.DoublyLinkedList(String){};
-        list.append(node);
+        // create new item
+        var item = try self.alloc.create(ListItem);
+        item.data = .{ .value = e, .expires_at = null };
+        list.append(&item.node);
 
-        const value: Value = .{ .list = .{ .value = list } };
+        const value: Value = .{ .list = .{ .list = list } };
         try self.map.put(k, value);
 
         return 1;
@@ -183,8 +189,8 @@ pub const Store = struct {
         self.rw.lockShared();
         defer self.rw.unlockShared();
 
-        var copied = AllocatedList.init(alloc);
-        errdefer copied.deinit();
+        var copied = AllocatedList.init();
+        errdefer copied.deinit(alloc);
 
         if (start > 0 and stop > 0 and start > stop) {
             // cannot index, return empty
@@ -192,9 +198,9 @@ pub const Store = struct {
         }
 
         const exists = self.map.get(key);
-        if (exists) |value| {
-            assert(std.meta.activeTag(value) == .list);
-            const length = value.list.value.len;
+        if (exists) |entry| {
+            assert(std.meta.activeTag(entry) == .list);
+            const length = entry.list.list.len(); // TODO: fix len
 
             const i_start: usize = start: {
                 if (start >= length) {
@@ -234,13 +240,14 @@ pub const Store = struct {
                 break :stop @as(usize, @abs(stop));
             };
 
-            const list = value.list.value;
+            const list = entry.list.list;
             var current = list.first;
             var i: usize = 0;
             while (current) |node| {
                 if (i_start <= i and i <= i_stop) {
-                    const str = try alloc.dupe(u8, node.data.value);
-                    try copied.list.append(.{ .value = str, .expires_at = null });
+                    const item: *ListItem = @fieldParentPtr("node", node);
+                    const str = try alloc.dupe(u8, item.data.value);
+                    try copied.list.append(alloc, .{ .value = str, .expires_at = null });
                 }
 
                 current = node.next;
@@ -259,7 +266,7 @@ pub const Store = struct {
         const exists = self.map.get(key);
         if (exists) |value| {
             assert(std.meta.activeTag(value) == .list);
-            return value.list.value.len;
+            return value.list.list.len(); // TODO: fix len
         }
 
         return 0;
@@ -271,20 +278,22 @@ pub const Store = struct {
         defer self.rw.unlock();
 
         const exists = self.map.getPtr(key);
-        if (exists) |value| {
-            assert(std.meta.activeTag(value.*) == .list);
+        if (exists) |entry| {
+            assert(std.meta.activeTag(entry.*) == .list);
 
             // prepare to copy elements out of list
-            var copied = AllocatedList.init(alloc);
-            errdefer copied.deinit();
+            var copied = AllocatedList.init();
+            errdefer copied.deinit(alloc);
 
             for (0..count) |_| {
-                if (value.*.list.value.popFirst()) |node| {
-                    const str = try alloc.dupe(u8, node.data.value);
-                    try copied.list.append(.{ .value = str, .expires_at = null });
+                // TODO: handle length update here too
+                if (entry.*.list.list.popFirst()) |node| {
+                    const item: *ListItem = @fieldParentPtr("node", node);
+                    const str = try alloc.dupe(u8, item.data.value);
+                    try copied.list.append(alloc, .{ .value = str, .expires_at = null });
 
-                    self.alloc.free(node.data.value);
-                    self.alloc.destroy(node);
+                    self.alloc.free(item.data.value);
+                    self.alloc.destroy(item);
                 }
             }
 
@@ -300,21 +309,22 @@ pub const Store = struct {
 
         var iter = self.map.iterator();
         while (iter.next()) |entry| {
-            // free all keys and values
+            // free key
             self.alloc.free(entry.key_ptr.*);
 
+            // free all values
             const v = entry.value_ptr.*;
             switch (std.meta.activeTag(v)) {
                 .string => self.alloc.free(v.string.value),
                 .list => {
-                    var node = v.list.value.first;
+                    var node = v.list.list.first;
                     while (node) |n| {
-                        // free inner string array
-                        self.alloc.free(n.data.value);
+                        // free inner string
+                        const item: *ListItem = @fieldParentPtr("node", n);
                         node = n.next;
 
-                        // destory node itself
-                        self.alloc.destroy(n);
+                        self.alloc.free(item.data.value);
+                        self.alloc.destroy(item);
                     }
                 },
             }
@@ -458,7 +468,7 @@ test "lrange (rpush) list does not exist" {
     var store = Store.init(alloc, &timer);
     defer store.deinit();
 
-    const expected = AllocatedList.init(alloc);
+    const expected = AllocatedList.init();
     const actual = try store.lrange(alloc, "nope", 0, 10);
 
     try std.testing.expectEqual(expected, actual);
@@ -477,23 +487,23 @@ test "lrange (rpush) list exists" {
     _ = try store.rpush("list", "b");
     _ = try store.rpush("list", "c");
 
-    var expected = AllocatedList.init(alloc);
+    var expected = AllocatedList.init();
     // NOTE: deinit the underlying list directly in tests
     // If we don't, we segfault trying to dealloc the `.value` items below
     // (since they are statically initialized)
-    defer expected.list.deinit();
+    defer expected.list.deinit(alloc);
 
-    try expected.list.append(.{ .value = "a", .expires_at = null });
-    try expected.list.append(.{ .value = "b", .expires_at = null });
-    try expected.list.append(.{ .value = "c", .expires_at = null });
+    try expected.list.append(alloc, .{ .value = "a", .expires_at = null });
+    try expected.list.append(alloc, .{ .value = "b", .expires_at = null });
+    try expected.list.append(alloc, .{ .value = "c", .expires_at = null });
 
     var inrange = try store.lrange(alloc, "list", 0, 2);
     var outrange = try store.lrange(alloc, "list", 0, 3);
     var wayoutrange = try store.lrange(alloc, "list", 0, 100);
     // NOTE: These are safe to deinit/dealloc, as they are dynamically allocated in lrange()
-    defer inrange.deinit();
-    defer outrange.deinit();
-    defer wayoutrange.deinit();
+    defer inrange.deinit(alloc);
+    defer outrange.deinit(alloc);
+    defer wayoutrange.deinit(alloc);
 
     try std.testing.expectEqualDeep(expected, inrange);
     try std.testing.expectEqualDeep(expected, outrange);
@@ -509,8 +519,8 @@ test "lrange (rpush) weird start and stop" {
     var store = Store.init(alloc, &timer);
     defer store.deinit();
 
-    var expected = AllocatedList.init(alloc);
-    defer expected.list.deinit();
+    var expected = AllocatedList.init();
+    defer expected.list.deinit(alloc);
 
     // start > stop
     try std.testing.expectEqualDeep(expected, try store.lrange(alloc, "list", 1, 0));
@@ -518,7 +528,7 @@ test "lrange (rpush) weird start and stop" {
 
     // start == stop, empty
     var empty = try store.lrange(alloc, "list", 0, 0);
-    defer empty.deinit();
+    defer empty.deinit(alloc);
     try std.testing.expectEqualDeep(expected, empty);
 
     // start == stop, multiple elements
@@ -526,9 +536,9 @@ test "lrange (rpush) weird start and stop" {
     _ = try store.rpush("list", "b");
     _ = try store.rpush("list", "c");
 
-    try expected.list.append(.{ .value = "a", .expires_at = null });
+    try expected.list.append(alloc, .{ .value = "a", .expires_at = null });
     var one_element = try store.lrange(alloc, "list", 0, 0);
-    defer one_element.deinit();
+    defer one_element.deinit(alloc);
 
     try std.testing.expectEqualDeep(expected, one_element);
 }
@@ -542,8 +552,8 @@ test "lrange (rpush) negative start and stop" {
     var store = Store.init(alloc, &timer);
     defer store.deinit();
 
-    var expected = AllocatedList.init(alloc);
-    defer expected.list.deinit();
+    var expected = AllocatedList.init();
+    defer expected.list.deinit(alloc);
 
     // negative, empty
     try std.testing.expectEqualDeep(expected, try store.lrange(alloc, "list", -10, -10));
@@ -557,25 +567,25 @@ test "lrange (rpush) negative start and stop" {
     _ = try store.rpush("list", "c");
     _ = try store.rpush("list", "d");
 
-    try expected.list.append(.{ .value = "a", .expires_at = null });
-    try expected.list.append(.{ .value = "b", .expires_at = null });
-    try expected.list.append(.{ .value = "c", .expires_at = null });
-    try expected.list.append(.{ .value = "d", .expires_at = null });
+    try expected.list.append(alloc, .{ .value = "a", .expires_at = null });
+    try expected.list.append(alloc, .{ .value = "b", .expires_at = null });
+    try expected.list.append(alloc, .{ .value = "c", .expires_at = null });
+    try expected.list.append(alloc, .{ .value = "d", .expires_at = null });
 
     var test1 = try store.lrange(alloc, "list", -1, -1);
-    defer test1.deinit();
+    defer test1.deinit(alloc);
     try std.testing.expectEqualDeep(expected.list.items[3..4], test1.list.items);
 
     var test2 = try store.lrange(alloc, "list", -2, -1);
-    defer test2.deinit();
+    defer test2.deinit(alloc);
     try std.testing.expectEqualDeep(expected.list.items[2..4], test2.list.items);
 
     var test3 = try store.lrange(alloc, "list", 0, -3);
-    defer test3.deinit();
+    defer test3.deinit(alloc);
     try std.testing.expectEqualDeep(expected.list.items[0..2], test3.list.items);
 
     var test4 = try store.lrange(alloc, "list", 0, -1);
-    defer test4.deinit();
+    defer test4.deinit(alloc);
     try std.testing.expectEqualDeep(expected.list.items[0..4], test4.list.items);
 }
 
@@ -588,8 +598,8 @@ test "lrange (lpush)" {
     var store = Store.init(alloc, &timer);
     defer store.deinit();
 
-    var expected = AllocatedList.init(alloc);
-    defer expected.list.deinit();
+    var expected = AllocatedList.init();
+    defer expected.list.deinit(alloc);
 
     // negative, empty
     try std.testing.expectEqualDeep(expected, try store.lrange(alloc, "list", -10, -10));
@@ -603,25 +613,25 @@ test "lrange (lpush)" {
     _ = try store.lpush("list", "c");
     _ = try store.lpush("list", "d");
 
-    try expected.list.append(.{ .value = "d", .expires_at = null });
-    try expected.list.append(.{ .value = "c", .expires_at = null });
-    try expected.list.append(.{ .value = "b", .expires_at = null });
-    try expected.list.append(.{ .value = "a", .expires_at = null });
+    try expected.list.append(alloc, .{ .value = "d", .expires_at = null });
+    try expected.list.append(alloc, .{ .value = "c", .expires_at = null });
+    try expected.list.append(alloc, .{ .value = "b", .expires_at = null });
+    try expected.list.append(alloc, .{ .value = "a", .expires_at = null });
 
     var test1 = try store.lrange(alloc, "list", -1, -1);
-    defer test1.deinit();
+    defer test1.deinit(alloc);
     try std.testing.expectEqualDeep(expected.list.items[3..4], test1.list.items);
 
     var test2 = try store.lrange(alloc, "list", -2, -1);
-    defer test2.deinit();
+    defer test2.deinit(alloc);
     try std.testing.expectEqualDeep(expected.list.items[2..4], test2.list.items);
 
     var test3 = try store.lrange(alloc, "list", 0, -3);
-    defer test3.deinit();
+    defer test3.deinit(alloc);
     try std.testing.expectEqualDeep(expected.list.items[0..2], test3.list.items);
 
     var test4 = try store.lrange(alloc, "list", 0, -1);
-    defer test4.deinit();
+    defer test4.deinit(alloc);
     try std.testing.expectEqualDeep(expected.list.items[0..4], test4.list.items);
 }
 
@@ -664,28 +674,28 @@ test "lpop" {
     _ = try store.rpush("list", "c");
     _ = try store.rpush("list", "d");
 
-    var expected = AllocatedList.init(alloc);
-    defer expected.list.deinit();
+    var expected = AllocatedList.init();
+    defer expected.list.deinit(alloc);
 
     // count = 0, return empty
     var empty = try store.lpop(alloc, "list", 0);
-    defer empty.?.deinit();
+    defer empty.?.deinit(alloc);
     try std.testing.expectEqualDeep(expected, empty);
 
     // count = 1
-    try expected.list.append(.{ .value = "a", .expires_at = null });
+    try expected.list.append(alloc, .{ .value = "a", .expires_at = null });
     var count1 = try store.lpop(alloc, "list", 1);
-    defer count1.?.deinit();
+    defer count1.?.deinit(alloc);
 
     try std.testing.expectEqualDeep(expected, count1.?);
     try std.testing.expectEqual(3, store.llen("list"));
 
     // count = 2
-    expected.list.clearAndFree();
-    try expected.list.append(.{ .value = "b", .expires_at = null });
-    try expected.list.append(.{ .value = "c", .expires_at = null });
+    expected.list.clearAndFree(alloc);
+    try expected.list.append(alloc, .{ .value = "b", .expires_at = null });
+    try expected.list.append(alloc, .{ .value = "c", .expires_at = null });
     var count2 = try store.lpop(alloc, "list", 2);
-    defer count2.?.deinit();
+    defer count2.?.deinit(alloc);
 
     try std.testing.expectEqualDeep(expected, count2.?);
 }

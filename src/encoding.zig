@@ -20,14 +20,14 @@ pub const BulkArray = struct {
     // caller is responsible for freeing returned str
     pub fn encode(alloc: std.mem.Allocator, elements: []const []const u8) !Self {
         var encoded = try std.ArrayList([]const u8).initCapacity(alloc, elements.len + 1);
-        defer encoded.deinit();
+        defer encoded.deinit(alloc);
 
         const n = try std.fmt.allocPrint(alloc, "*{d}\r\n", .{elements.len});
-        try encoded.append(n);
+        try encoded.append(alloc, n);
 
         for (elements) |element| {
             const e = try std.fmt.allocPrint(alloc, "${d}\r\n{s}\r\n", .{ element.len, element });
-            try encoded.append(e);
+            try encoded.append(alloc, e);
         }
 
         const str = try std.mem.concat(alloc, u8, encoded.items);
