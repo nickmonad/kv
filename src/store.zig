@@ -14,7 +14,8 @@ pub const String = struct {
 };
 
 pub const List = struct {
-    list: std.DoublyLinkedList,
+    linked: std.DoublyLinkedList,
+    len: usize = 0,
 };
 
 pub const ListItem = struct {
@@ -154,12 +155,12 @@ pub const Store = struct {
             item.data = .{ .value = e, .expires_at = null };
 
             switch (direction) {
-                .left => entry.list.list.prepend(&item.node),
-                .right => entry.list.list.append(&item.node),
+                .left => entry.list.linked.prepend(&item.node),
+                .right => entry.list.linked.append(&item.node),
             }
 
-            // TODO: this is horribly inefficient, we should keep track of the length
-            return entry.*.list.list.len();
+            entry.*.list.len += 1;
+            return entry.*.list.len;
         }
 
         // list does not exist
@@ -175,10 +176,10 @@ pub const Store = struct {
         item.data = .{ .value = e, .expires_at = null };
         list.append(&item.node);
 
-        const value: Value = .{ .list = .{ .list = list } };
+        const value: Value = .{ .list = .{ .linked = list, .len = 1 } };
         try self.map.put(k, value);
 
-        return 1;
+        return value.list.len;
     }
 
     // lrange
@@ -200,7 +201,7 @@ pub const Store = struct {
         const exists = self.map.get(key);
         if (exists) |entry| {
             assert(std.meta.activeTag(entry) == .list);
-            const length = entry.list.list.len(); // TODO: fix len
+            const length = entry.list.len;
 
             const i_start: usize = start: {
                 if (start >= length) {
@@ -240,7 +241,7 @@ pub const Store = struct {
                 break :stop @as(usize, @abs(stop));
             };
 
-            const list = entry.list.list;
+            const list = entry.list.linked;
             var current = list.first;
             var i: usize = 0;
             while (current) |node| {
@@ -264,9 +265,9 @@ pub const Store = struct {
         defer self.rw.unlockShared();
 
         const exists = self.map.get(key);
-        if (exists) |value| {
-            assert(std.meta.activeTag(value) == .list);
-            return value.list.list.len(); // TODO: fix len
+        if (exists) |entry| {
+            assert(std.meta.activeTag(entry) == .list);
+            return entry.list.len;
         }
 
         return 0;
@@ -286,14 +287,15 @@ pub const Store = struct {
             errdefer copied.deinit(alloc);
 
             for (0..count) |_| {
-                // TODO: handle length update here too
-                if (entry.*.list.list.popFirst()) |node| {
+                if (entry.list.linked.popFirst()) |node| {
                     const item: *ListItem = @fieldParentPtr("node", node);
                     const str = try alloc.dupe(u8, item.data.value);
                     try copied.list.append(alloc, .{ .value = str, .expires_at = null });
 
                     self.alloc.free(item.data.value);
                     self.alloc.destroy(item);
+
+                    entry.list.len -= 1;
                 }
             }
 
@@ -317,7 +319,7 @@ pub const Store = struct {
             switch (std.meta.activeTag(v)) {
                 .string => self.alloc.free(v.string.value),
                 .list => {
-                    var node = v.list.list.first;
+                    var node = v.list.linked.first;
                     while (node) |n| {
                         // free inner string
                         const item: *ListItem = @fieldParentPtr("node", n);
