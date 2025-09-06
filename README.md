@@ -4,7 +4,7 @@ kv
 `kv` is a simple Redis-compatible key/value store.
 
 > [!WARNING]
-> Definitely not for production usage. Maybe someday.
+> Definitely not for production usage. Maybe someday. Please don't depend on this.
 
 
 ## Goals
