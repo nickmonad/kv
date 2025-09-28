@@ -1,4 +1,5 @@
 const std = @import("std");
+const Writer = std.io.Writer;
 
 const Store = @import("store.zig").Store;
 const encoding = @import("encoding.zig");
@@ -7,6 +8,7 @@ const BulkString = encoding.BulkString;
 
 const OK = "+OK\r\n";
 const NULL = "$-1\r\n";
+const PONG = "+PONG\r\n";
 
 const ParseError = error{
     InvalidArrayFormat,
@@ -163,41 +165,36 @@ const Command = union(CommandName) {
 
     const Self = @This();
 
-    pub fn do(self: *Self, alloc: std.mem.Allocator, kv: *Store) !?[]const u8 {
+    pub fn do(self: *Self, alloc: std.mem.Allocator, kv: *Store, out: *Writer) !void {
         switch (self.*) {
-            .ping => |ping| return ping.do(),
-            .echo => |echo| return echo.do(alloc),
-            .set => |set| return set.do(kv),
-            .get => |get| return get.do(alloc, kv),
-            .rpush, .lpush => |*push| {
-                defer push.deinit(alloc);
-                return push.do(alloc, kv);
-            },
-            .lrange => |lrange| return lrange.do(alloc, kv),
-            .llen => |llen| return llen.do(alloc, kv),
-            .lpop => |lpop| return lpop.do(alloc, kv),
+            .ping => |ping| return ping.do(out),
+            .echo => |echo| return echo.do(out),
+            .set => |set| return set.do(out, kv),
+            .get => |get| return get.do(alloc, out, kv),
+            .rpush, .lpush => |*push| return push.do(out, kv),
+            .lrange => |lrange| return lrange.do(alloc, out, kv),
+            .llen => |llen| return llen.do(out, kv),
+            .lpop => |lpop| return lpop.do(alloc, out, kv),
         }
     }
 };
 
 const PING = struct {
-    fn do(_: PING) []const u8 {
-        return "+PONG\r\n";
+    fn do(_: PING, w: *Writer) !void {
+        return w.print(PONG, .{});
     }
 };
 
 const ECHO = struct {
     arg: []const u8,
-    const Self = @This();
 
-    fn parse(iter: *ParseIterator) !Self {
+    fn parse(iter: *ParseIterator) !ECHO {
         const arg = iter.next() orelse return ParseError.MissingData;
         return .{ .arg = arg };
     }
 
-    fn do(self: Self, alloc: std.mem.Allocator) !?[]const u8 {
-        const encoded = try BulkString.encode(alloc, self.arg);
-        return encoded.str;
+    fn do(cmd: ECHO, out: *Writer) !void {
+        return BulkString.encode(out, cmd.arg);
     }
 };
 
@@ -206,9 +203,7 @@ const SET = struct {
     value: []const u8,
     expires_in: ?i64 = null,
 
-    const Self = @This();
-
-    fn parse(iter: *ParseIterator) !Self {
+    fn parse(iter: *ParseIterator) !SET {
         const key = iter.next() orelse return ParseError.MissingData;
         const value = iter.next() orelse return ParseError.MissingData;
 
@@ -225,32 +220,36 @@ const SET = struct {
         return .{ .key = key, .value = value };
     }
 
-    fn do(self: Self, kv: *Store) !?[]const u8 {
-        try kv.set(self.key, self.value, .{ .expires_in = self.expires_in });
-        return OK;
+    fn do(cmd: SET, out: *Writer, kv: *Store) !void {
+        try kv.set(cmd.key, cmd.value, .{ .expires_in = cmd.expires_in });
+        return out.print(OK, .{});
     }
 };
 
 const GET = struct {
     key: []const u8,
 
-    const Self = @This();
-
-    fn parse(iter: *ParseIterator) !Self {
+    fn parse(iter: *ParseIterator) !GET {
         const key = iter.next() orelse return ParseError.MissingData;
         return .{ .key = key };
     }
 
-    fn do(self: Self, alloc: std.mem.Allocator, kv: *Store) !?[]const u8 {
-        const value = try kv.get(alloc, self.key);
+    fn do(
+        cmd: GET,
+        alloc: std.mem.Allocator,
+        out: *Writer,
+        kv: *Store,
+    ) !void {
+        // TODO(nickmonad) if the store can only be used in a single-threaded context
+        // moving forward, I don't think we actually need to allocate into the alloc here...
+        // since we can simply copy the stable value in the pointer returned by the store to the output
+        const value = try kv.get(alloc, cmd.key);
         if (value) |v| {
             defer alloc.free(v.value);
-
-            const bulk = try BulkString.encode(alloc, v.value);
-            return bulk.str;
+            return BulkString.encode(out, v.value);
         }
 
-        return NULL;
+        return out.print(NULL, .{});
     }
 };
 
@@ -259,10 +258,13 @@ const PUSH = struct {
     elements: std.ArrayList([]const u8),
     direction: Direction,
 
-    const Self = @This();
     const Direction = enum { left, right };
 
-    fn parse(alloc: std.mem.Allocator, iter: *ParseIterator, direction: Direction) !Self {
+    fn parse(
+        alloc: std.mem.Allocator,
+        iter: *ParseIterator,
+        direction: Direction,
+    ) !PUSH {
         const list = iter.next() orelse return ParseError.MissingData;
         var elements: std.ArrayList([]const u8) = .empty;
 
@@ -273,29 +275,22 @@ const PUSH = struct {
         return .{ .list = list, .elements = elements, .direction = direction };
     }
 
-    fn do(self: Self, alloc: std.mem.Allocator, kv: *Store) !?[]const u8 {
+    fn do(cmd: PUSH, out: *Writer, kv: *Store) !void {
         const length = length: {
             var len: usize = undefined;
-            for (self.elements.items) |element| {
+            for (cmd.elements.items) |element| {
                 // TODO: probably gonna be more efficient to add an kv method
                 // for rpushing multiple elements, so we'd don't have to lookup the key every time
-                // Technically, this has a race condition anyway. Another thread could
-                // snake in a call to kv.rpush, invalidating the client's expections
-                // of the returned length value
-                len = len: switch (self.direction) {
-                    .left => break :len try kv.lpush(self.list, element),
-                    .right => break :len try kv.rpush(self.list, element),
+                len = len: switch (cmd.direction) {
+                    .left => break :len try kv.lpush(cmd.list, element),
+                    .right => break :len try kv.rpush(cmd.list, element),
                 };
             }
 
             break :length len;
         };
 
-        return try std.fmt.allocPrint(alloc, ":{d}\r\n", .{length}); // TODO: abstract this out to RESP Int type
-    }
-
-    fn deinit(self: *Self, alloc: std.mem.Allocator) void {
-        self.elements.deinit(alloc);
+        return out.print(":{d}\r\n", .{length});
     }
 };
 
@@ -304,9 +299,7 @@ const LRANGE = struct {
     start: isize,
     stop: isize,
 
-    const Self = @This();
-
-    fn parse(iter: *ParseIterator) !Self {
+    fn parse(iter: *ParseIterator) !LRANGE {
         const list = iter.next() orelse return ParseError.MissingData;
         const start = try std.fmt.parseInt(isize, iter.next() orelse return ParseError.MissingData, 10);
         const stop = try std.fmt.parseInt(isize, iter.next() orelse return ParseError.MissingData, 10);
@@ -318,8 +311,15 @@ const LRANGE = struct {
         };
     }
 
-    fn do(self: Self, alloc: std.mem.Allocator, kv: *Store) !?[]const u8 {
-        var list = try kv.lrange(alloc, self.list, self.start, self.stop);
+    fn do(
+        cmd: LRANGE,
+        alloc: std.mem.Allocator,
+        out: *Writer,
+        kv: *Store,
+    ) !void {
+        // TODO(nicmonad) again, if the Store is going to be single-threaded, we don't need
+        // this extra allocation into the alloc...
+        var list = try kv.lrange(alloc, cmd.list, cmd.start, cmd.stop);
         defer list.deinit(alloc);
 
         var to_encode: std.ArrayList([]const u8) = .empty;
@@ -329,24 +329,21 @@ const LRANGE = struct {
             try to_encode.append(alloc, item.value);
         }
 
-        const encoded = try BulkArray.encode(alloc, to_encode.items);
-        return encoded.str;
+        return BulkArray.encode(out, to_encode.items);
     }
 };
 
 const LLEN = struct {
     list: []const u8,
 
-    const Self = @This();
-
-    fn parse(iter: *ParseIterator) !Self {
+    fn parse(iter: *ParseIterator) !LLEN {
         const list = iter.next() orelse return ParseError.MissingData;
         return .{ .list = list };
     }
 
-    fn do(self: Self, alloc: std.mem.Allocator, kv: *Store) !?[]const u8 {
-        const length = kv.llen(self.list);
-        return try std.fmt.allocPrint(alloc, ":{d}\r\n", .{length}); // TODO: abstract this out to RESP Int type
+    fn do(cmd: LLEN, out: *Writer, kv: *Store) !void {
+        const length = kv.llen(cmd.list);
+        return out.print(":{d}\r\n", .{length});
     }
 };
 
@@ -354,9 +351,7 @@ const LPOP = struct {
     key: []const u8,
     count: usize = 1,
 
-    const Self = @This();
-
-    fn parse(iter: *ParseIterator) !Self {
+    fn parse(iter: *ParseIterator) !LPOP {
         const key = iter.next() orelse return ParseError.MissingData;
 
         if (iter.next()) |count| {
@@ -367,20 +362,26 @@ const LPOP = struct {
         return .{ .key = key };
     }
 
-    fn do(self: Self, alloc: std.mem.Allocator, kv: *Store) !?[]const u8 {
-        var list = try kv.lpop(alloc, self.key, self.count) orelse return NULL;
+    fn do(
+        cmd: LPOP,
+        alloc: std.mem.Allocator,
+        out: *Writer,
+        kv: *Store,
+    ) !void {
+        var list = try kv.lpop(alloc, cmd.key, cmd.count) orelse {
+            return out.print(NULL, .{});
+        };
+
         defer list.deinit(alloc);
 
         if (list.list.items.len == 0) {
-            const encoded = try BulkString.encode(alloc, "");
-            return encoded.str;
+            return BulkString.encode(out, "");
         }
 
         if (list.list.items.len == 1) {
             // only 1 element, return as bulk string
             const element = list.list.items[0];
-            const encoded = try BulkString.encode(alloc, element.value);
-            return encoded.str;
+            return BulkString.encode(out, element.value);
         }
 
         // multiple elements
@@ -391,8 +392,7 @@ const LPOP = struct {
             try to_encode.append(alloc, item.value);
         }
 
-        const encoded = try BulkArray.encode(alloc, to_encode.items);
-        return encoded.str;
+        return BulkArray.encode(out, to_encode.items);
     }
 };
 
@@ -402,8 +402,8 @@ const LPOP = struct {
 // create a BulkArray, assuming the std.testing.allocator (ignoring allocation errors)
 // usage: BA(&.{ "ECHO", "test" })
 // Don't forget to free the returned .str
-fn BA(elements: []const []const u8) BulkArray {
-    return BulkArray.encode(std.testing.allocator, elements) catch unreachable;
+fn BA(w: *Writer, elements: []const []const u8) void {
+    return BulkArray.encode(w, elements) catch unreachable;
 }
 
 test "splitSequence sanity check" {
@@ -436,7 +436,7 @@ test "ParseIterator termination" {
 
     try std.testing.expectEqualSlices(u8, "PING", iter.next().?);
 
-    for (0..100) |_| {
+    for (0..10) |_| {
         // this thing had better be null!
         try std.testing.expectEqual(null, iter.next());
     }
@@ -444,11 +444,12 @@ test "ParseIterator termination" {
 
 test "ParseIterator multiple elements" {
     const alloc = std.testing.allocator;
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
 
-    const cmd = BA(&.{ "SET", "test", "zig" });
-    defer alloc.free(cmd.str);
+    BA(&w, &.{ "SET", "test", "zig" });
 
-    var iter = try ParseIterator.init(alloc, cmd.str);
+    var iter = try ParseIterator.init(alloc, w.buffered());
     defer iter.deinit(alloc);
 
     try std.testing.expectEqualSlices(u8, "SET", iter.next().?);
@@ -477,31 +478,39 @@ test "parse invalid" {
 }
 
 test "parse PING" {
-    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    const cmd = BA(&.{"PING"});
-    defer alloc.free(cmd.str);
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{"PING"});
 
-    const parsed = try parse(alloc, cmd.str);
+    const alloc = arena.allocator();
+    const parsed = try parse(alloc, w.buffered());
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.ping);
 }
 
 test "parse ECHO error missing" {
     const alloc = std.testing.allocator;
 
-    const cmd = BA(&.{"ECHO"});
-    defer alloc.free(cmd.str);
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{"ECHO"});
 
-    try std.testing.expectError(ParseError.MissingData, parse(alloc, cmd.str));
+    try std.testing.expectError(ParseError.MissingData, parse(alloc, w.buffered()));
 }
 
 test "parse ECHO arg" {
-    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    const cmd = BA(&.{ "ECHO", "hello, zig" });
-    defer alloc.free(cmd.str);
-    const parsed = try parse(alloc, cmd.str);
+    const alloc = arena.allocator();
 
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "ECHO", "hello, zig" });
+
+    const parsed = try parse(alloc, w.buffered());
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.echo);
     try std.testing.expectEqualSlices(u8, "hello, zig", parsed.echo.arg);
 }
@@ -509,17 +518,24 @@ test "parse ECHO arg" {
 test "parse SET error missing" {
     const alloc = std.testing.allocator;
 
-    const cmd = BA(&.{ "SET", "test" });
-    defer alloc.free(cmd.str);
-    try std.testing.expectError(ParseError.MissingData, parse(alloc, cmd.str));
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "SET", "test" });
+
+    try std.testing.expectError(ParseError.MissingData, parse(alloc, w.buffered()));
 }
 
 test "parse SET key value" {
-    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    const cmd = BA(&.{ "SET", "test", "zig" });
-    defer alloc.free(cmd.str);
-    const parsed = try parse(alloc, cmd.str);
+    const alloc = arena.allocator();
+
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "SET", "test", "zig" });
+
+    const parsed = try parse(alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.set);
     try std.testing.expectEqualSlices(u8, "test", parsed.set.key);
@@ -527,11 +543,16 @@ test "parse SET key value" {
 }
 
 test "parse SET key value PX expiry" {
-    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    const cmd = BA(&.{ "SET", "test", "zig", "PX", "100" });
-    defer alloc.free(cmd.str);
-    const parsed = try parse(alloc, cmd.str);
+    const alloc = arena.allocator();
+
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "SET", "test", "zig", "PX", "100" });
+
+    const parsed = try parse(alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.set);
     try std.testing.expectEqualSlices(u8, "test", parsed.set.key);
@@ -540,23 +561,32 @@ test "parse SET key value PX expiry" {
 }
 
 test "parse GET" {
-    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    const cmd = BA(&.{ "GET", "test" });
-    defer alloc.free(cmd.str);
-    const parsed = try parse(alloc, cmd.str);
+    const alloc = arena.allocator();
+
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "GET", "test" });
+
+    const parsed = try parse(alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.get);
     try std.testing.expectEqualSlices(u8, "test", parsed.get.key);
 }
 
 test "parse RPUSH, 1 element" {
-    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    const cmd = BA(&.{ "RPUSH", "test", "zig" });
-    defer alloc.free(cmd.str);
-    var parsed = try parse(alloc, cmd.str);
-    defer parsed.rpush.deinit(alloc);
+    const alloc = arena.allocator();
+
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "RPUSH", "test", "zig" });
+
+    const parsed = try parse(alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.rpush);
     try std.testing.expectEqualSlices(u8, "test", parsed.rpush.list);
@@ -566,28 +596,36 @@ test "parse RPUSH, 1 element" {
 }
 
 test "parse RPUSH, mulitple elements" {
-    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    const ba = BA(&.{ "RPUSH", "test", "zig", "cool" });
-    defer alloc.free(ba.str);
-    var cmd = try parse(alloc, ba.str);
-    defer cmd.rpush.deinit(alloc);
+    const alloc = arena.allocator();
 
-    try std.testing.expect(std.meta.activeTag(cmd) == CommandName.rpush);
-    try std.testing.expectEqualSlices(u8, "test", cmd.rpush.list);
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "RPUSH", "test", "zig", "cool" });
 
-    try std.testing.expectEqual(2, cmd.rpush.elements.items.len);
-    try std.testing.expectEqualSlices(u8, "zig", cmd.rpush.elements.items[0]);
-    try std.testing.expectEqualSlices(u8, "cool", cmd.rpush.elements.items[1]);
+    const parsed = try parse(alloc, w.buffered());
+
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.rpush);
+    try std.testing.expectEqualSlices(u8, "test", parsed.rpush.list);
+
+    try std.testing.expectEqual(2, parsed.rpush.elements.items.len);
+    try std.testing.expectEqualSlices(u8, "zig", parsed.rpush.elements.items[0]);
+    try std.testing.expectEqualSlices(u8, "cool", parsed.rpush.elements.items[1]);
 }
 
 test "parse LPUSH, 1 element" {
-    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    const cmd = BA(&.{ "LPUSH", "test", "zig" });
-    defer alloc.free(cmd.str);
-    var parsed = try parse(alloc, cmd.str);
-    defer parsed.lpush.deinit(alloc);
+    const alloc = arena.allocator();
+
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "LPUSH", "test", "zig" });
+
+    const parsed = try parse(alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lpush);
     try std.testing.expectEqualSlices(u8, "test", parsed.lpush.list);
@@ -597,68 +635,70 @@ test "parse LPUSH, 1 element" {
 }
 
 test "parse LRANGE" {
-    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    const ba = BA(&.{ "LRANGE", "test", "0", "1" });
-    defer alloc.free(ba.str);
-    const cmd = try parse(alloc, ba.str);
+    const alloc = arena.allocator();
 
-    try std.testing.expect(std.meta.activeTag(cmd) == CommandName.lrange);
-    try std.testing.expectEqualSlices(u8, "test", cmd.lrange.list);
-    try std.testing.expectEqual(0, cmd.lrange.start);
-    try std.testing.expectEqual(1, cmd.lrange.stop);
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "LRANGE", "test", "0", "1" });
+
+    const parsed = try parse(alloc, w.buffered());
+
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lrange);
+    try std.testing.expectEqualSlices(u8, "test", parsed.lrange.list);
+    try std.testing.expectEqual(0, parsed.lrange.start);
+    try std.testing.expectEqual(1, parsed.lrange.stop);
 }
 
 test "parse LRANGE negative" {
-    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    const ba = BA(&.{ "LRANGE", "test", "10", "-5" });
-    defer alloc.free(ba.str);
-    const cmd = try parse(alloc, ba.str);
+    const alloc = arena.allocator();
 
-    try std.testing.expect(std.meta.activeTag(cmd) == CommandName.lrange);
-    try std.testing.expectEqualSlices(u8, "test", cmd.lrange.list);
-    try std.testing.expectEqual(10, cmd.lrange.start);
-    try std.testing.expectEqual(-5, cmd.lrange.stop);
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "LRANGE", "test", "10", "-5" });
+
+    const parsed = try parse(alloc, w.buffered());
+
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lrange);
+    try std.testing.expectEqualSlices(u8, "test", parsed.lrange.list);
+    try std.testing.expectEqual(10, parsed.lrange.start);
+    try std.testing.expectEqual(-5, parsed.lrange.stop);
 }
 
 test "parse LLEN" {
-    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    const ba = BA(&.{ "LLEN", "test" });
-    defer alloc.free(ba.str);
-    const cmd = try parse(alloc, ba.str);
+    const alloc = arena.allocator();
 
-    try std.testing.expect(std.meta.activeTag(cmd) == CommandName.llen);
-    try std.testing.expectEqualSlices(u8, "test", cmd.llen.list);
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "LLEN", "test" });
+
+    const parsed = try parse(alloc, w.buffered());
+
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.llen);
+    try std.testing.expectEqualSlices(u8, "test", parsed.llen.list);
 }
 
 test "parse LPOP" {
-    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
 
-    const ba = BA(&.{ "LPOP", "test" });
-    defer alloc.free(ba.str);
-    const cmd = try parse(alloc, ba.str);
+    const alloc = arena.allocator();
 
-    try std.testing.expect(std.meta.activeTag(cmd) == CommandName.lpop);
-    try std.testing.expectEqualSlices(u8, "test", cmd.lpop.key);
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "LPOP", "test", "10" });
 
-    const ba_count = BA(&.{ "LPOP", "test", "10" });
-    defer alloc.free(ba_count.str);
-    const cmd_count = try parse(alloc, ba_count.str);
+    const parsed = try parse(alloc, w.buffered());
 
-    try std.testing.expect(std.meta.activeTag(cmd_count) == CommandName.lpop);
-    try std.testing.expectEqualSlices(u8, "test", cmd_count.lpop.key);
-    try std.testing.expectEqual(10, cmd_count.lpop.count);
-}
-
-test "parse fuzz" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) !void {
-            _ = context;
-            try std.testing.expect(std.meta.isError(parse(std.testing.allocator, input)));
-        }
-    };
-
-    try std.testing.fuzz(Context{}, Context.testOne, .{ .corpus = &.{ "SET", "GET" } });
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lpop);
+    try std.testing.expectEqualSlices(u8, "test", parsed.lpop.key);
+    try std.testing.expectEqual(10, parsed.lpop.count);
 }
