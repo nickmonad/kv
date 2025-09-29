@@ -23,8 +23,8 @@ const IO_URING_ENTIRES = 1024;
 const Connection = struct {
     client: posix.socket_t = undefined,
 
-    recv_buffer: []u8 = undefined,
-    send_buffer: []u8 = undefined,
+    recv_buffer: []u8,
+    send_buffer: []u8,
 
     completion: Completion = undefined,
 };
@@ -68,65 +68,60 @@ const Operation = union(enum) {
 };
 
 const ConnectionPool = struct {
-    connections: std.heap.MemoryPoolExtra(Connection, .{ .growable = false }),
+    const Pool = std.heap.MemoryPoolExtra(Connection, .{ .growable = false });
 
-    recv_alloc: std.heap.FixedBufferAllocator,
-    send_alloc: std.heap.FixedBufferAllocator,
+    arena: std.heap.ArenaAllocator,
+    connections: Pool,
 
-    // used during deinit()
-    gpa: std.mem.Allocator,
-    recv_buffers: []u8,
-    send_buffers: []u8,
+    fn init(gpa: std.mem.Allocator, max_connections: usize) !ConnectionPool {
+        var arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer arena.deinit();
 
-    fn init(gpa: std.mem.Allocator, max: usize) !ConnectionPool {
-        // each connection has one recv and send buffer (each 4 KB)
-        // TODO(nickmonad): make per buffer size configurable
-        // NOTE(nickmonad): these may not necessarily need to be separate allocation "spaces", we could
-        // just have one massive buffer space (max * 2 * 4 KB) (maybe?)
-        const recv_buffers = try gpa.alloc(u8, max * 4096);
-        const send_buffers = try gpa.alloc(u8, max * 4096);
+        var pool = try Pool.initPreheated(gpa, max_connections);
+        errdefer pool.deinit();
+
+        var connections: std.ArrayList(*Connection) = try .initCapacity(gpa, max_connections);
+        defer connections.deinit(gpa);
+
+        for (0..max_connections) |_| {
+            var connection = try pool.create();
+
+            // TODO(nickmonad): make per buffer size configurable
+            const recv_buffer = try arena.allocator().alloc(u8, 4096);
+            const send_buffer = try arena.allocator().alloc(u8, 4096);
+
+            assert(recv_buffer.len == 4096);
+
+            connection.recv_buffer = recv_buffer;
+            connection.send_buffer = send_buffer;
+
+            connections.appendAssumeCapacity(connection);
+        }
+
+        // release connections back to pool
+        assert(connections.items.len == max_connections);
+        for (connections.items) |connection| {
+            pool.destroy(connection);
+        }
 
         return .{
-            .connections = try std.heap.MemoryPoolExtra(Connection, .{ .growable = false }).initPreheated(gpa, max),
-            .recv_alloc = std.heap.FixedBufferAllocator.init(recv_buffers),
-            .send_alloc = std.heap.FixedBufferAllocator.init(send_buffers),
-            .gpa = gpa,
-            .recv_buffers = recv_buffers,
-            .send_buffers = send_buffers,
+            .arena = arena,
+            .connections = pool,
         };
     }
 
     fn deinit(self: *ConnectionPool) void {
-        self.gpa.free(self.recv_buffers);
-        self.gpa.free(self.send_buffers);
-
         self.connections.deinit();
+        self.arena.deinit();
     }
 
     fn create(self: *ConnectionPool) !*Connection {
-        const new: *Connection = try self.connections.create();
-
-        // Invariant!
-        // Buffer space is determined by number of connections since they are always allocated together here.
-        // If we can get a connection, we can get recv and send buffers.
-        // TODO(nickmonad): store buffer size on struct
-        const recv_buffer = self.recv_alloc.allocator().alloc(u8, 4096) catch unreachable;
-        const send_buffer = self.send_alloc.allocator().alloc(u8, 4096) catch unreachable;
-
-        new.recv_buffer = recv_buffer;
-        new.send_buffer = send_buffer;
-
-        return new;
+        return self.connections.create();
     }
 
     fn destroy(self: *ConnectionPool, connection: *Connection) void {
-        // TODO(nickmonad) this should be a SQE to prevent blocking thread on syscall
+        // TODO(nickmonad) this should be a SQE to prevent blocking thread on syscall (handled in Server)
         _ = linux.close(connection.client);
-
-        // ensure buffer space is returned
-        self.recv_alloc.allocator().free(connection.recv_buffer);
-        self.send_alloc.allocator().free(connection.send_buffer);
-
         self.connections.destroy(connection);
     }
 };
@@ -213,12 +208,14 @@ const Server = struct {
 
     fn on_accept(self: *Server, client: posix.socket_t) void {
         assert(self.completion.operation == .accept);
-        const connection = self.connections.create() catch {
+        var connection = self.connections.create() catch {
             // TODO(nickmonad)
             // use a statically allocated buffer for error response to the client here
             // also be sure to cleanup the socket resource
             std.debug.panic("OOM for new connection! need to kick error back to client", .{});
         };
+
+        std.debug.print("connection.recv_buffer.len = {d}\n", .{connection.recv_buffer.len});
 
         connection.client = client;
         connection.completion = .{
