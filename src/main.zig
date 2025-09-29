@@ -67,8 +67,6 @@ const Operation = union(enum) {
     },
 };
 
-// TODO(nickmonad)
-// unit tests for this guy
 const ConnectionPool = struct {
     connections: std.heap.MemoryPoolExtra(Connection, .{ .growable = false }),
 
@@ -347,7 +345,7 @@ test {
     std.testing.refAllDecls(@This());
 }
 
-test "memory pool growable = false" {
+test "MemoryPoolExtra growable = false" {
     const alloc = std.testing.allocator;
 
     var pool = try std.heap.MemoryPoolExtra(Connection, .{ .growable = false }).initPreheated(alloc, 5);
@@ -366,5 +364,25 @@ test "memory pool growable = false" {
 
     _ = try pool.create();
 
+    try std.testing.expectError(error.OutOfMemory, pool.create());
+}
+
+test "ConnectionPool" {
+    const alloc = std.testing.allocator;
+
+    var pool = try ConnectionPool.init(alloc, 2);
+    defer pool.deinit();
+
+    // create (1) and (2)
+    const c = try pool.create();
+    _ = try pool.create();
+    // fail on (3)
+    try std.testing.expectError(error.OutOfMemory, pool.create());
+
+    // destroy (1)
+    pool.destroy(c);
+    // create another
+    _ = try pool.create();
+    // maxed out, fail again
     try std.testing.expectError(error.OutOfMemory, pool.create());
 }
