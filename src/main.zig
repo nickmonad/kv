@@ -23,10 +23,14 @@ const IO_URING_ENTIRES = 1024;
 const Connection = struct {
     client: posix.socket_t = undefined,
 
-    recv_buffer: []u8,
-    send_buffer: []u8,
+    recv_buffer: *Buffer,
+    send_buffer: *Buffer,
 
     completion: Completion = undefined,
+
+    fn valid(c: Connection) bool {
+        return c.recv_buffer.reserved and c.send_buffer.reserved;
+    }
 };
 
 const Completion = struct {
@@ -67,61 +71,101 @@ const Operation = union(enum) {
     },
 };
 
-const ConnectionPool = struct {
-    const Pool = std.heap.MemoryPoolExtra(Connection, .{ .growable = false });
+const Buffer = struct {
+    buf: []u8 = undefined,
+    next: ?*Buffer = null,
+    reserved: bool = false,
+};
 
+const BufferPool = struct {
     arena: std.heap.ArenaAllocator,
-    connections: Pool,
+    free: ?*Buffer = null,
 
-    fn init(gpa: std.mem.Allocator, max_connections: usize) !ConnectionPool {
+    fn init(gpa: std.mem.Allocator, num: u32, buffer_size: usize) !BufferPool {
         var arena = std.heap.ArenaAllocator.init(gpa);
-        errdefer arena.deinit();
+        var free: ?*Buffer = null;
 
-        var pool = try Pool.initPreheated(gpa, max_connections);
-        errdefer pool.deinit();
+        for (0..num) |_| {
+            const buffer = try arena.allocator().create(Buffer);
+            const buf = try arena.allocator().alloc(u8, buffer_size);
 
-        var connections: std.ArrayList(*Connection) = try .initCapacity(gpa, max_connections);
-        defer connections.deinit(gpa);
+            buffer.* = .{
+                .buf = buf,
+                .next = free,
+            };
 
-        for (0..max_connections) |_| {
-            var connection = try pool.create();
-
-            // TODO(nickmonad): make per buffer size configurable
-            const recv_buffer = try arena.allocator().alloc(u8, 4096);
-            const send_buffer = try arena.allocator().alloc(u8, 4096);
-
-            assert(recv_buffer.len == 4096);
-
-            connection.recv_buffer = recv_buffer;
-            connection.send_buffer = send_buffer;
-
-            connections.appendAssumeCapacity(connection);
-        }
-
-        // release connections back to pool
-        assert(connections.items.len == max_connections);
-        for (connections.items) |connection| {
-            pool.destroy(connection);
+            free = buffer;
         }
 
         return .{
             .arena = arena,
+            .free = free,
+        };
+    }
+
+    fn deinit(pool: *BufferPool) void {
+        pool.arena.deinit();
+    }
+
+    fn reserve(pool: *BufferPool) error{OutOfMemory}!*Buffer {
+        if (pool.free) |buffer| {
+            pool.free = buffer.next;
+
+            buffer.next = null;
+            buffer.reserved = true;
+
+            return buffer;
+        }
+
+        return error.OutOfMemory;
+    }
+
+    fn release(pool: *BufferPool, buffer: *Buffer) void {
+        buffer.reserved = false;
+        buffer.next = pool.free;
+        pool.free = buffer;
+    }
+};
+
+const ConnectionPool = struct {
+    const Pool = std.heap.MemoryPoolExtra(Connection, .{ .growable = false });
+
+    buffers: BufferPool,
+    connections: Pool,
+
+    fn init(gpa: std.mem.Allocator, max_connections: u32) !ConnectionPool {
+        const pool = try Pool.initPreheated(gpa, max_connections);
+        const buffers = try BufferPool.init(gpa, max_connections * 2, 4096);
+
+        return .{
+            .buffers = buffers,
             .connections = pool,
         };
     }
 
     fn deinit(self: *ConnectionPool) void {
+        self.buffers.deinit();
         self.connections.deinit();
-        self.arena.deinit();
     }
 
     fn create(self: *ConnectionPool) !*Connection {
-        return self.connections.create();
+        const connection = try self.connections.create();
+        const recv = try self.buffers.reserve();
+        const send = try self.buffers.reserve();
+
+        connection.recv_buffer = recv;
+        connection.send_buffer = send;
+
+        return connection;
     }
 
     fn destroy(self: *ConnectionPool, connection: *Connection) void {
         // TODO(nickmonad) this should be a SQE to prevent blocking thread on syscall (handled in Server)
         _ = linux.close(connection.client);
+
+        self.buffers.release(connection.recv_buffer);
+        self.buffers.release(connection.send_buffer);
+
         self.connections.destroy(connection);
     }
 };
@@ -208,6 +252,7 @@ const Server = struct {
 
     fn on_accept(self: *Server, client: posix.socket_t) void {
         assert(self.completion.operation == .accept);
+
         var connection = self.connections.create() catch {
             // TODO(nickmonad)
             // use a statically allocated buffer for error response to the client here
@@ -215,14 +260,14 @@ const Server = struct {
             std.debug.panic("OOM for new connection! need to kick error back to client", .{});
         };
 
-        std.debug.print("connection.recv_buffer.len = {d}\n", .{connection.recv_buffer.len});
+        assert(connection.valid());
 
         connection.client = client;
         connection.completion = .{
             .operation = .{
                 .recv = .{
                     .socket = client,
-                    .buffer = connection.recv_buffer,
+                    .buffer = connection.recv_buffer.buf,
                 },
             },
         };
@@ -237,6 +282,8 @@ const Server = struct {
 
     fn on_recv(self: *Server, connection: *Connection, read: usize) void {
         assert(connection.completion.operation == .recv);
+        assert(connection.valid());
+
         if (read == 0) {
             // connection closed by client, cleanup
             self.close(connection);
@@ -246,19 +293,19 @@ const Server = struct {
         // wrap send_buffer in allocator
         // command will "write" to this allocator
         // TODO(nickmonad) handle command failure (OOM or otherwise?)
-        var output: Writer = .fixed(connection.send_buffer);
+        var output: Writer = .fixed(connection.send_buffer.buf);
 
         const alloc = self.fba.allocator();
         defer self.fba.reset();
 
         // TODO(nickmonad) handle parsing error
-        var cmd = command.parse(alloc, connection.recv_buffer[0..read]) catch unreachable;
+        var cmd = command.parse(alloc, connection.recv_buffer.buf[0..read]) catch unreachable;
         cmd.do(alloc, self.kv, &output) catch unreachable;
 
         connection.completion.operation = .{
             .send = .{
                 .socket = connection.client,
-                .buffer = connection.send_buffer,
+                .buffer = connection.send_buffer.buf,
                 .length = output.buffered().len,
             },
         };
@@ -271,13 +318,14 @@ const Server = struct {
 
     fn on_send(self: *Server, connection: *Connection) void {
         assert(connection.completion.operation == .send);
+        assert(connection.valid());
 
         // send complete!
         // keep connection alive, check for recv from client
         connection.completion.operation = .{
             .recv = .{
                 .socket = connection.client,
-                .buffer = connection.recv_buffer,
+                .buffer = connection.recv_buffer.buf,
             },
         };
 
@@ -288,6 +336,7 @@ const Server = struct {
     }
 
     fn close(self: *Server, connection: *Connection) void {
+        assert(connection.valid());
         self.connections.destroy(connection);
     }
 };
@@ -382,4 +431,49 @@ test "ConnectionPool" {
     _ = try pool.create();
     // maxed out, fail again
     try std.testing.expectError(error.OutOfMemory, pool.create());
+}
+
+test "BufferPool" {
+    const alloc = std.testing.allocator;
+    const buffer_size = 1024;
+
+    var pool = try BufferPool.init(alloc, 5, buffer_size);
+    defer pool.deinit();
+
+    // reserve buffer (1) and check properties
+    const buffer = try pool.reserve();
+
+    try std.testing.expectEqual(buffer_size, buffer.buf.len);
+
+    // release buffer (1)
+    pool.release(buffer);
+
+    // reserve all buffers, ensure OOM when at max
+    _ = try pool.reserve();
+    _ = try pool.reserve();
+    _ = try pool.reserve();
+    _ = try pool.reserve();
+    _ = try pool.reserve();
+
+    try std.testing.expectError(error.OutOfMemory, pool.reserve());
+}
+
+test "BufferPool sanity check" {
+    const alloc = std.testing.allocator;
+    const buffer_size = 1024;
+
+    var pool = try BufferPool.init(alloc, 5, buffer_size);
+    defer pool.deinit();
+
+    // reserve buffer (1) and set data
+    const buffer = try pool.reserve();
+    buffer.buf[0] = @as(u8, 'z');
+
+    // release buffer (1)
+    pool.release(buffer);
+
+    // reserve buffer again, should be same as (1)
+    // ... not that we would ever depend on this!
+    const again = try pool.reserve();
+    try std.testing.expectEqual(@as(u8, 'z'), again.buf[0]);
 }

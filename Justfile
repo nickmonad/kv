@@ -15,7 +15,7 @@ run:
     zig build run
 
 test-cli:
-    @rm -f test.cli.out
+    rm -f test.cli.out
     @redis-cli PING >> test.cli.out
     @redis-cli ECHO zig >> test.cli.out
     @redis-cli SET test zig >> test.cli.out

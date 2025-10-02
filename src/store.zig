@@ -105,6 +105,9 @@ pub const Store = struct {
 
         const value = self.map.get(key);
         if (value) |v| {
+            // TODO: this fails when user does a GET <key> and the key refers to a list, not a string
+            // so this is probably a bad assertion... similar to the list one
+            // need to rethink the data model here
             assert(std.meta.activeTag(v) == .string);
 
             // check expires_at, return null if expired
