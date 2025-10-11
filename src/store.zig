@@ -28,18 +28,16 @@ const PushDirection = enum { left, right };
 pub const AllocatedList = struct {
     list: std.ArrayList(String),
 
-    const Self = @This();
-
-    fn init() Self {
+    fn init() AllocatedList {
         return .{ .list = .empty };
     }
 
-    pub fn deinit(self: *Self, alloc: std.mem.Allocator) void {
-        for (self.list.items) |item| {
+    pub fn deinit(list: *AllocatedList, alloc: std.mem.Allocator) void {
+        for (list.list.items) |item| {
             alloc.free(item.value);
         }
 
-        self.list.deinit(alloc);
+        list.list.deinit(alloc);
     }
 };
 
@@ -53,9 +51,7 @@ pub const Store = struct {
     rw: std.Thread.RwLock,
     timer: *Timer,
 
-    const Self = @This();
-
-    pub fn init(alloc: std.mem.Allocator, timer: *Timer) Self {
+    pub fn init(alloc: std.mem.Allocator, timer: *Timer) Store {
         return .{
             .alloc = alloc,
             .map = std.StringHashMap(Value).init(alloc),
@@ -69,41 +65,41 @@ pub const Store = struct {
     // key will be copied into internal space for later retrieval
     // value is copied by internal map and allocator
     // NOTE: for now, all keys are overwritten if they already exist
-    pub fn set(self: *Store, key: Key, str: []const u8, opts: SetOptions) !void {
-        self.rw.lock();
-        defer self.rw.unlock();
+    pub fn set(store: *Store, key: Key, str: []const u8, opts: SetOptions) !void {
+        store.rw.lock();
+        defer store.rw.unlock();
 
         // copy the key and value before put...
         // we always have to copy key because keys are managed by us (see std.StringHashMap doc)
         // we also have to copy the value... otherwise we'd get an assignment-level copy of the value given
         // which, in this case, is a pointer to a slice, and we need the whole value
-        const k = try self.alloc.dupe(u8, key);
-        const s = try self.alloc.dupe(u8, str);
+        const k = try store.alloc.dupe(u8, key);
+        const s = try store.alloc.dupe(u8, str);
 
         // TODO: move this calculation to the higher Set command
         // then, we can take the String type as the argument to this `set()` function,
         // lining it up with the return of get()
         const expires_at = ex: {
             if (opts.expires_in) |e| {
-                break :ex self.timer.getTime() + e;
+                break :ex store.timer.getTime() + e;
             } else {
                 break :ex null;
             }
         };
 
         const value: Value = .{ .string = .{ .value = s, .expires_at = expires_at } };
-        return self.map.put(k, value);
+        return store.map.put(k, value);
     }
 
     // get
     // copies out the stored String using the given allocator
     // otherwise, we'd return pointers directly into the store's map, which another thread can manipulate
     // basically, once we're out of the lock guard (in the caller), we need to have safe memory access
-    pub fn get(self: *Store, alloc: std.mem.Allocator, key: Key) !?String {
-        self.rw.lockShared();
-        defer self.rw.unlockShared();
+    pub fn get(store: *Store, alloc: std.mem.Allocator, key: Key) !?String {
+        store.rw.lockShared();
+        defer store.rw.unlockShared();
 
-        const value = self.map.get(key);
+        const value = store.map.get(key);
         if (value) |v| {
             // TODO: this fails when user does a GET <key> and the key refers to a list, not a string
             // so this is probably a bad assertion... similar to the list one
@@ -112,7 +108,7 @@ pub const Store = struct {
 
             // check expires_at, return null if expired
             if (v.string.expires_at) |expires_at| {
-                const now = self.timer.getTime();
+                const now = store.timer.getTime();
                 if (now > expires_at) return null;
                 // TODO: also clear value from map?
             }
@@ -128,33 +124,33 @@ pub const Store = struct {
     // rpush
     // append element to (r)ight of list (i.e. the end)
     // return the current length of the list
-    pub fn rpush(self: *Store, key: Key, element: []const u8) !usize {
-        return self.push(key, element, .right);
+    pub fn rpush(store: *Store, key: Key, element: []const u8) !usize {
+        return store.push(key, element, .right);
     }
 
     // lpush
     // append element to (l)eft of list (i.e. the start)
     // return the current length of the list
-    pub fn lpush(self: *Store, key: Key, element: []const u8) !usize {
-        return self.push(key, element, .left);
+    pub fn lpush(store: *Store, key: Key, element: []const u8) !usize {
+        return store.push(key, element, .left);
     }
 
     // push
     // generalized list "push"
     // allows for .left or .right direction
-    fn push(self: *Store, key: Key, element: []const u8, direction: PushDirection) !usize {
-        self.rw.lock();
-        defer self.rw.unlock();
+    fn push(store: *Store, key: Key, element: []const u8, direction: PushDirection) !usize {
+        store.rw.lock();
+        defer store.rw.unlock();
 
-        const exists = self.map.getPtr(key);
+        const exists = store.map.getPtr(key);
         if (exists) |entry| {
             assert(std.meta.activeTag(entry.*) == .list);
 
             // copy element
-            const e = try self.alloc.dupe(u8, element);
+            const e = try store.alloc.dupe(u8, element);
 
             // create new list item
-            var item = try self.alloc.create(ListItem);
+            var item = try store.alloc.create(ListItem);
             item.data = .{ .value = e, .expires_at = null };
 
             switch (direction) {
@@ -168,19 +164,19 @@ pub const Store = struct {
 
         // list does not exist
         // copy key and element... see note in `set()` for why
-        const k = try self.alloc.dupe(u8, key);
-        const e = try self.alloc.dupe(u8, element);
+        const k = try store.alloc.dupe(u8, key);
+        const e = try store.alloc.dupe(u8, element);
 
         // create new list
         var list: std.DoublyLinkedList = .{};
 
         // create new item
-        var item = try self.alloc.create(ListItem);
+        var item = try store.alloc.create(ListItem);
         item.data = .{ .value = e, .expires_at = null };
         list.append(&item.node);
 
         const value: Value = .{ .list = .{ .linked = list, .len = 1 } };
-        try self.map.put(k, value);
+        try store.map.put(k, value);
 
         return value.list.len;
     }
@@ -189,9 +185,9 @@ pub const Store = struct {
     // copies the list (if exists) out using the given allocator
     // this prevents returning pointers directly into the map
     // (similar to get)
-    pub fn lrange(self: *Store, alloc: std.mem.Allocator, key: Key, start: isize, stop: isize) !AllocatedList {
-        self.rw.lockShared();
-        defer self.rw.unlockShared();
+    pub fn lrange(store: *Store, alloc: std.mem.Allocator, key: Key, start: isize, stop: isize) !AllocatedList {
+        store.rw.lockShared();
+        defer store.rw.unlockShared();
 
         var copied = AllocatedList.init();
         errdefer copied.deinit(alloc);
@@ -201,7 +197,7 @@ pub const Store = struct {
             return copied;
         }
 
-        const exists = self.map.get(key);
+        const exists = store.map.get(key);
         if (exists) |entry| {
             assert(std.meta.activeTag(entry) == .list);
             const length = entry.list.len;
@@ -263,11 +259,11 @@ pub const Store = struct {
     }
 
     // llen
-    pub fn llen(self: *Store, key: Key) usize {
-        self.rw.lockShared();
-        defer self.rw.unlockShared();
+    pub fn llen(store: *Store, key: Key) usize {
+        store.rw.lockShared();
+        defer store.rw.unlockShared();
 
-        const exists = self.map.get(key);
+        const exists = store.map.get(key);
         if (exists) |entry| {
             assert(std.meta.activeTag(entry) == .list);
             return entry.list.len;
@@ -277,11 +273,11 @@ pub const Store = struct {
     }
 
     // lpop
-    pub fn lpop(self: *Store, alloc: std.mem.Allocator, key: Key, count: usize) !?AllocatedList {
-        self.rw.lock();
-        defer self.rw.unlock();
+    pub fn lpop(store: *Store, alloc: std.mem.Allocator, key: Key, count: usize) !?AllocatedList {
+        store.rw.lock();
+        defer store.rw.unlock();
 
-        const exists = self.map.getPtr(key);
+        const exists = store.map.getPtr(key);
         if (exists) |entry| {
             assert(std.meta.activeTag(entry.*) == .list);
 
@@ -295,8 +291,8 @@ pub const Store = struct {
                     const str = try alloc.dupe(u8, item.data.value);
                     try copied.list.append(alloc, .{ .value = str, .expires_at = null });
 
-                    self.alloc.free(item.data.value);
-                    self.alloc.destroy(item);
+                    store.alloc.free(item.data.value);
+                    store.alloc.destroy(item);
 
                     entry.list.len -= 1;
                 }
@@ -308,19 +304,19 @@ pub const Store = struct {
         return null;
     }
 
-    pub fn deinit(self: *Store) void {
-        self.rw.lock();
-        defer self.rw.unlock();
+    pub fn deinit(store: *Store) void {
+        store.rw.lock();
+        defer store.rw.unlock();
 
-        var iter = self.map.iterator();
+        var iter = store.map.iterator();
         while (iter.next()) |entry| {
             // free key
-            self.alloc.free(entry.key_ptr.*);
+            store.alloc.free(entry.key_ptr.*);
 
             // free all values
             const v = entry.value_ptr.*;
             switch (std.meta.activeTag(v)) {
-                .string => self.alloc.free(v.string.value),
+                .string => store.alloc.free(v.string.value),
                 .list => {
                     var node = v.list.linked.first;
                     while (node) |n| {
@@ -328,14 +324,14 @@ pub const Store = struct {
                         const item: *ListItem = @fieldParentPtr("node", n);
                         node = n.next;
 
-                        self.alloc.free(item.data.value);
-                        self.alloc.destroy(item);
+                        store.alloc.free(item.data.value);
+                        store.alloc.destroy(item);
                     }
                 },
             }
         }
 
-        self.map.deinit();
+        store.map.deinit();
     }
 };
 
@@ -348,8 +344,8 @@ pub const Timer = union(TimerType) {
     system: *SystemTimer,
     mock: *MockTimer,
 
-    pub fn getTime(self: *Timer) i64 {
-        switch (self.*) {
+    pub fn getTime(timer: *Timer) i64 {
+        switch (timer.*) {
             .system => |system| return system.getTime(),
             .mock => |mock| return mock.getTime(),
         }
@@ -365,8 +361,8 @@ pub const SystemTimer = struct {
 pub const MockTimer = struct {
     current: i64 = 0,
 
-    pub fn getTime(self: *MockTimer) i64 {
-        return self.current;
+    pub fn getTime(mock: *MockTimer) i64 {
+        return mock.current;
     }
 };
 

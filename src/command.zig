@@ -55,12 +55,10 @@ pub fn parse(alloc: std.mem.Allocator, buf: []const u8) !Command {
 }
 
 const ParseIterator = struct {
-    const Self = @This();
-
     parsed: std.ArrayList([]const u8),
     index: usize = 0,
 
-    fn init(alloc: std.mem.Allocator, buf: []const u8) !Self {
+    fn init(alloc: std.mem.Allocator, buf: []const u8) !ParseIterator {
         // iterator over raw bulk array buffer
         var iter = std.mem.splitSequence(u8, buf, "\r\n");
 
@@ -121,22 +119,22 @@ const ParseIterator = struct {
             return ParseError.InvalidArrayFormat;
         }
 
-        return Self{ .parsed = parsed };
+        return .{ .parsed = parsed };
     }
 
-    fn deinit(self: *Self, alloc: std.mem.Allocator) void {
-        self.parsed.deinit(alloc);
+    fn deinit(iter: *ParseIterator, alloc: std.mem.Allocator) void {
+        iter.parsed.deinit(alloc);
     }
 
-    fn next(self: *Self) ?[]const u8 {
-        if (self.index >= self.parsed.items.len) {
+    fn next(iter: *ParseIterator) ?[]const u8 {
+        if (iter.index >= iter.parsed.items.len) {
             return null;
         }
 
-        const current = self.index;
-        self.index += 1;
+        const current = iter.index;
+        iter.index += 1;
 
-        return self.parsed.items[current];
+        return iter.parsed.items[current];
     }
 };
 
@@ -163,15 +161,13 @@ const Command = union(CommandName) {
     llen: LLEN,
     lpop: LPOP,
 
-    const Self = @This();
-
-    pub fn do(self: *Self, alloc: std.mem.Allocator, kv: *Store, out: *Writer) !void {
-        switch (self.*) {
+    pub fn do(command: *Command, alloc: std.mem.Allocator, kv: *Store, out: *Writer) !void {
+        switch (command.*) {
             .ping => |ping| return ping.do(out),
             .echo => |echo| return echo.do(out),
             .set => |set| return set.do(out, kv),
             .get => |get| return get.do(alloc, out, kv),
-            .rpush, .lpush => |*push| return push.do(out, kv),
+            .rpush, .lpush => |push| return push.do(out, kv),
             .lrange => |lrange| return lrange.do(alloc, out, kv),
             .llen => |llen| return llen.do(out, kv),
             .lpop => |lpop| return lpop.do(alloc, out, kv),

@@ -37,8 +37,8 @@ const Completion = struct {
     result: i32 = undefined,
     operation: Operation,
 
-    fn prepare(self: *Completion, sqe: *io_uring_sqe) void {
-        switch (self.operation) {
+    fn prepare(completion: *Completion, sqe: *io_uring_sqe) void {
+        switch (completion.operation) {
             .accept => |*accept| {
                 sqe.prep_accept(accept.socket, &accept.address, &accept.address_len, 0);
             },
@@ -50,7 +50,7 @@ const Completion = struct {
             },
         }
 
-        sqe.user_data = @intFromPtr(self);
+        sqe.user_data = @intFromPtr(completion);
     }
 };
 
@@ -143,15 +143,15 @@ const ConnectionPool = struct {
         };
     }
 
-    fn deinit(self: *ConnectionPool) void {
-        self.buffers.deinit();
-        self.connections.deinit();
+    fn deinit(pool: *ConnectionPool) void {
+        pool.buffers.deinit();
+        pool.connections.deinit();
     }
 
-    fn create(self: *ConnectionPool) !*Connection {
-        const connection = try self.connections.create();
-        const recv = try self.buffers.reserve();
-        const send = try self.buffers.reserve();
+    fn create(pool: *ConnectionPool) !*Connection {
+        const connection = try pool.connections.create();
+        const recv = try pool.buffers.reserve();
+        const send = try pool.buffers.reserve();
 
         connection.recv_buffer = recv;
         connection.send_buffer = send;
@@ -159,14 +159,14 @@ const ConnectionPool = struct {
         return connection;
     }
 
-    fn destroy(self: *ConnectionPool, connection: *Connection) void {
+    fn destroy(pool: *ConnectionPool, connection: *Connection) void {
         // TODO(nickmonad) this should be a SQE to prevent blocking thread on syscall (handled in Server)
         _ = linux.close(connection.client);
 
-        self.buffers.release(connection.recv_buffer);
-        self.buffers.release(connection.send_buffer);
+        pool.buffers.release(connection.recv_buffer);
+        pool.buffers.release(connection.send_buffer);
 
-        self.connections.destroy(connection);
+        pool.connections.destroy(connection);
     }
 };
 
@@ -201,16 +201,16 @@ const Server = struct {
         };
     }
 
-    fn deinit(self: *Server) void {
-        self.ring.deinit();
+    fn deinit(server: *Server) void {
+        server.ring.deinit();
     }
 
-    fn run(self: *Server) !void {
-        assert(self.completion.operation == .accept);
+    fn run(server: *Server) !void {
+        assert(server.completion.operation == .accept);
 
         // start server with initial accept
-        const accept = try self.ring.get_sqe();
-        self.completion.prepare(accept);
+        const accept = try server.ring.get_sqe();
+        server.completion.prepare(accept);
 
         // main loop!
         // submit any outstanding SQEs,
@@ -218,12 +218,12 @@ const Server = struct {
         // process them,
         // rinse and repeat
         while (true) {
-            _ = try self.ring.submit_and_wait(1);
+            _ = try server.ring.submit_and_wait(1);
 
-            while (self.ring.cq_ready() > 0) {
-                const completed = try self.ring.copy_cqes(&self.cqes, 1);
+            while (server.ring.cq_ready() > 0) {
+                const completed = try server.ring.copy_cqes(&server.cqes, 1);
 
-                for (self.cqes[0..completed]) |cqe| {
+                for (server.cqes[0..completed]) |cqe| {
                     assert(cqe.user_data != 0);
 
                     const completion: *Completion = @ptrFromInt(cqe.user_data);
@@ -233,16 +233,16 @@ const Server = struct {
                     switch (completion.operation) {
                         .accept => {
                             const client: posix.fd_t = @intCast(cqe.res);
-                            self.on_accept(client);
+                            server.on_accept(client);
                         },
                         .recv => {
                             const n: usize = @intCast(cqe.res);
                             const connection: *Connection = @fieldParentPtr("completion", completion);
-                            self.on_recv(connection, n);
+                            server.on_recv(connection, n);
                         },
                         .send => {
                             const connection: *Connection = @fieldParentPtr("completion", completion);
-                            self.on_send(connection);
+                            server.on_send(connection);
                         },
                     }
                 }
@@ -250,10 +250,10 @@ const Server = struct {
         }
     }
 
-    fn on_accept(self: *Server, client: posix.socket_t) void {
-        assert(self.completion.operation == .accept);
+    fn on_accept(server: *Server, client: posix.socket_t) void {
+        assert(server.completion.operation == .accept);
 
-        var connection = self.connections.create() catch {
+        var connection = server.connections.create() catch {
             // TODO(nickmonad)
             // use a statically allocated buffer for error response to the client here
             // also be sure to cleanup the socket resource
@@ -273,20 +273,20 @@ const Server = struct {
         };
 
         // TODO(nickmonad) enqueue these if no more SQEs are available
-        const recv = self.ring.get_sqe() catch unreachable;
+        const recv = server.ring.get_sqe() catch unreachable;
         connection.completion.prepare(recv);
 
-        const accept = self.ring.get_sqe() catch unreachable;
-        self.completion.prepare(accept);
+        const accept = server.ring.get_sqe() catch unreachable;
+        server.completion.prepare(accept);
     }
 
-    fn on_recv(self: *Server, connection: *Connection, read: usize) void {
+    fn on_recv(server: *Server, connection: *Connection, read: usize) void {
         assert(connection.completion.operation == .recv);
         assert(connection.valid());
 
         if (read == 0) {
             // connection closed by client, cleanup
-            self.close(connection);
+            server.close(connection);
             return;
         }
 
@@ -295,12 +295,12 @@ const Server = struct {
         // TODO(nickmonad) handle command failure (OOM or otherwise?)
         var output: Writer = .fixed(connection.send_buffer.buf);
 
-        const alloc = self.fba.allocator();
-        defer self.fba.reset();
+        const alloc = server.fba.allocator();
+        defer server.fba.reset();
 
         // TODO(nickmonad) handle parsing error
         var cmd = command.parse(alloc, connection.recv_buffer.buf[0..read]) catch unreachable;
-        cmd.do(alloc, self.kv, &output) catch unreachable;
+        cmd.do(alloc, server.kv, &output) catch unreachable;
 
         connection.completion.operation = .{
             .send = .{
@@ -312,11 +312,11 @@ const Server = struct {
 
         // TODO(nickmonad)
         // same situation here as in on_recv, need to queue these up somehow
-        const send = self.ring.get_sqe() catch unreachable;
+        const send = server.ring.get_sqe() catch unreachable;
         connection.completion.prepare(send);
     }
 
-    fn on_send(self: *Server, connection: *Connection) void {
+    fn on_send(server: *Server, connection: *Connection) void {
         assert(connection.completion.operation == .send);
         assert(connection.valid());
 
@@ -331,13 +331,13 @@ const Server = struct {
 
         // TODO(nickmond)
         // again, queue these up if the submissions are full
-        const recv = self.ring.get_sqe() catch unreachable;
+        const recv = server.ring.get_sqe() catch unreachable;
         connection.completion.prepare(recv);
     }
 
-    fn close(self: *Server, connection: *Connection) void {
+    fn close(server: *Server, connection: *Connection) void {
         assert(connection.valid());
-        self.connections.destroy(connection);
+        server.connections.destroy(connection);
     }
 };
 
