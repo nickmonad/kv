@@ -11,6 +11,10 @@ const io_uring_sqe = linux.io_uring_sqe;
 const io_uring_cqe = linux.io_uring_cqe;
 const Writer = std.io.Writer;
 
+const buffer_pool = @import("buffer_pool.zig");
+const Buffer = buffer_pool.Buffer;
+const BufferPool = buffer_pool.BufferPool;
+
 const command = @import("command.zig");
 const store = @import("store.zig");
 const Store = store.Store;
@@ -69,62 +73,6 @@ const Operation = union(enum) {
         buffer: []u8,
         length: usize,
     },
-};
-
-const Buffer = struct {
-    buf: []u8 = undefined,
-    next: ?*Buffer = null,
-    reserved: bool = false,
-};
-
-const BufferPool = struct {
-    arena: std.heap.ArenaAllocator,
-    free: ?*Buffer = null,
-
-    fn init(gpa: std.mem.Allocator, num: u32, buffer_size: usize) !BufferPool {
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        var free: ?*Buffer = null;
-
-        for (0..num) |_| {
-            const buffer = try arena.allocator().create(Buffer);
-            const buf = try arena.allocator().alloc(u8, buffer_size);
-
-            buffer.* = .{
-                .buf = buf,
-                .next = free,
-            };
-
-            free = buffer;
-        }
-
-        return .{
-            .arena = arena,
-            .free = free,
-        };
-    }
-
-    fn deinit(pool: *BufferPool) void {
-        pool.arena.deinit();
-    }
-
-    fn reserve(pool: *BufferPool) error{OutOfMemory}!*Buffer {
-        if (pool.free) |buffer| {
-            pool.free = buffer.next;
-
-            buffer.next = null;
-            buffer.reserved = true;
-
-            return buffer;
-        }
-
-        return error.OutOfMemory;
-    }
-
-    fn release(pool: *BufferPool, buffer: *Buffer) void {
-        buffer.reserved = false;
-        buffer.next = pool.free;
-        pool.free = buffer;
-    }
 };
 
 const ConnectionPool = struct {
@@ -431,49 +379,4 @@ test "ConnectionPool" {
     _ = try pool.create();
     // maxed out, fail again
     try std.testing.expectError(error.OutOfMemory, pool.create());
-}
-
-test "BufferPool" {
-    const alloc = std.testing.allocator;
-    const buffer_size = 1024;
-
-    var pool = try BufferPool.init(alloc, 5, buffer_size);
-    defer pool.deinit();
-
-    // reserve buffer (1) and check properties
-    const buffer = try pool.reserve();
-
-    try std.testing.expectEqual(buffer_size, buffer.buf.len);
-
-    // release buffer (1)
-    pool.release(buffer);
-
-    // reserve all buffers, ensure OOM when at max
-    _ = try pool.reserve();
-    _ = try pool.reserve();
-    _ = try pool.reserve();
-    _ = try pool.reserve();
-    _ = try pool.reserve();
-
-    try std.testing.expectError(error.OutOfMemory, pool.reserve());
-}
-
-test "BufferPool sanity check" {
-    const alloc = std.testing.allocator;
-    const buffer_size = 1024;
-
-    var pool = try BufferPool.init(alloc, 5, buffer_size);
-    defer pool.deinit();
-
-    // reserve buffer (1) and set data
-    const buffer = try pool.reserve();
-    buffer.buf[0] = @as(u8, 'z');
-
-    // release buffer (1)
-    pool.release(buffer);
-
-    // reserve buffer again, should be same as (1)
-    // ... not that we would ever depend on this!
-    const again = try pool.reserve();
-    try std.testing.expectEqual(@as(u8, 'z'), again.buf[0]);
 }
