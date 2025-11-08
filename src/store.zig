@@ -1,337 +1,147 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-pub const Key = []const u8;
+const buffer_pool = @import("./buffer_pool.zig");
+const Buffer = buffer_pool.Buffer;
+const BufferPool = buffer_pool.BufferPool;
 
-pub const Value = union(enum) {
+const Entry = struct {
+    // associate value with key
+    // so that we can free it as needed
+    key: *const Buffer,
+    value: Value,
+};
+
+const Value = union(enum) {
     string: String,
     list: List,
 };
 
-pub const String = struct {
-    value: []const u8,
-    expires_at: ?i64, // type defined by std.time
+const String = struct {
+    data: *const Buffer,
 };
 
-pub const List = struct {
+const List = struct {
     linked: std.DoublyLinkedList,
     len: usize = 0,
 };
 
-pub const ListItem = struct {
+const ListItem = struct {
     node: std.DoublyLinkedList.Node,
     data: String,
 };
 
-const PushDirection = enum { left, right };
-
-pub const AllocatedList = struct {
-    list: std.ArrayList(String),
-
-    fn init() AllocatedList {
-        return .{ .list = .empty };
-    }
-
-    pub fn deinit(list: *AllocatedList, alloc: std.mem.Allocator) void {
-        for (list.list.items) |item| {
-            alloc.free(item.value);
-        }
-
-        list.list.deinit(alloc);
-    }
-};
+pub const PushDirection = enum { left, right };
 
 pub const SetOptions = struct {
     expires_in: ?i64 = null, // milliseconds, type defined by std.time
 };
 
 pub const Store = struct {
-    alloc: std.mem.Allocator,
-    map: std.StringHashMap(Value),
-    rw: std.Thread.RwLock,
+    map: std.StringHashMapUnmanaged(Entry),
+
+    keys: BufferPool,
+    values: BufferPool,
+
     timer: *Timer,
 
-    pub fn init(alloc: std.mem.Allocator, timer: *Timer) Store {
+    /// Initialize the Store with a given number of keys.
+    /// Space for keys will be allocated, along with space of values.
+    /// Currently, the space allocated for values will be double the amount allocated for keys.
+    /// This is to ensure that the number of _associations_ of key to value can be closer
+    /// to what is configured here as `size`, in the event a handful of keys allocate many
+    /// values as part of a list.
+    pub fn init(gpa: std.mem.Allocator, size: u32, timer: *Timer) error{OutOfMemory}!Store {
+        const num_keys = size;
+        const num_vals = num_keys * 2;
+
+        var map: std.StringHashMapUnmanaged(Entry) = .empty;
+        try map.ensureTotalCapacity(gpa, num_keys);
+
+        // TODO(nickmonad) config
+        const keys = try BufferPool.init(gpa, num_keys, 1024);
+        const values = try BufferPool.init(gpa, num_vals, 1024);
+
         return .{
-            .alloc = alloc,
-            .map = std.StringHashMap(Value).init(alloc),
-            .rw = .{},
+            .map = map,
+            .keys = keys,
+            .values = values,
             .timer = timer,
         };
     }
 
-    // set
-    // maps to key to value
-    // key will be copied into internal space for later retrieval
-    // value is copied by internal map and allocator
-    // NOTE: for now, all keys are overwritten if they already exist
-    pub fn set(store: *Store, key: Key, str: []const u8, opts: SetOptions) !void {
-        store.rw.lock();
-        defer store.rw.unlock();
+    pub fn deinit(store: *Store, gpa: std.mem.Allocator) void {
+        store.keys.deinit();
+        store.values.deinit();
 
-        // copy the key and value before put...
-        // we always have to copy key because keys are managed by us (see std.StringHashMap doc)
-        // we also have to copy the value... otherwise we'd get an assignment-level copy of the value given
-        // which, in this case, is a pointer to a slice, and we need the whole value
-        const k = try store.alloc.dupe(u8, key);
-        const s = try store.alloc.dupe(u8, str);
-
-        // TODO: move this calculation to the higher Set command
-        // then, we can take the String type as the argument to this `set()` function,
-        // lining it up with the return of get()
-        const expires_at = ex: {
-            if (opts.expires_in) |e| {
-                break :ex store.timer.getTime() + e;
-            } else {
-                break :ex null;
-            }
-        };
-
-        const value: Value = .{ .string = .{ .value = s, .expires_at = expires_at } };
-        return store.map.put(k, value);
+        store.map.deinit(gpa);
     }
 
-    // get
-    // copies out the stored String using the given allocator
-    // otherwise, we'd return pointers directly into the store's map, which another thread can manipulate
-    // basically, once we're out of the lock guard (in the caller), we need to have safe memory access
-    pub fn get(store: *Store, alloc: std.mem.Allocator, key: Key) !?String {
-        store.rw.lockShared();
-        defer store.rw.unlockShared();
+    // debug stats
+    pub fn debug(store: *Store) void {
+        std.debug.print("map capacity = {d}, map size = {d}, available = {d}\n", .{
+            store.map.capacity(),
+            store.map.size,
+            store.map.available,
+        });
 
-        const value = store.map.get(key);
-        if (value) |v| {
-            // TODO: this fails when user does a GET <key> and the key refers to a list, not a string
-            // so this is probably a bad assertion... similar to the list one
-            // need to rethink the data model here
-            assert(std.meta.activeTag(v) == .string);
+        var it = store.map.iterator();
+        while (it.next()) |entry| {
+            std.debug.print("{s}\n", .{entry.key_ptr.*});
+        }
+    }
 
-            // check expires_at, return null if expired
-            if (v.string.expires_at) |expires_at| {
-                const now = store.timer.getTime();
-                if (now > expires_at) return null;
-                // TODO: also clear value from map?
-            }
-
-            // allocate copy
-            const copied = try alloc.dupe(u8, v.string.value);
-            return .{ .value = copied, .expires_at = v.string.expires_at };
+    pub fn set(store: *Store, key_data: []const u8, val_data: []const u8, _: SetOptions) error{OutOfMemory}!void {
+        if (store.map.available == 0) {
+            // while the map _technically_ has capacity, we can't associate
+            // any more keys beyond the configured load factor, as we risk
+            // a full scan on a hash conflict
+            return error.OutOfMemory;
         }
 
-        return null;
-    }
+        // TODO(nickmonad)
+        // check if key or value length is greater than configured maximums
 
-    // rpush
-    // append element to (r)ight of list (i.e. the end)
-    // return the current length of the list
-    pub fn rpush(store: *Store, key: Key, element: []const u8) !usize {
-        return store.push(key, element, .right);
-    }
-
-    // lpush
-    // append element to (l)eft of list (i.e. the start)
-    // return the current length of the list
-    pub fn lpush(store: *Store, key: Key, element: []const u8) !usize {
-        return store.push(key, element, .left);
-    }
-
-    // push
-    // generalized list "push"
-    // allows for .left or .right direction
-    fn push(store: *Store, key: Key, element: []const u8, direction: PushDirection) !usize {
-        store.rw.lock();
-        defer store.rw.unlock();
-
-        const exists = store.map.getPtr(key);
-        if (exists) |entry| {
-            assert(std.meta.activeTag(entry.*) == .list);
-
-            // copy element
-            const e = try store.alloc.dupe(u8, element);
-
-            // create new list item
-            var item = try store.alloc.create(ListItem);
-            item.data = .{ .value = e, .expires_at = null };
-
-            switch (direction) {
-                .left => entry.list.linked.prepend(&item.node),
-                .right => entry.list.linked.append(&item.node),
-            }
-
-            entry.*.list.len += 1;
-            return entry.*.list.len;
+        if (store.map.remove(key_data)) {
+            std.debug.print("found existing\n", .{});
         }
 
-        // list does not exist
-        // copy key and element... see note in `set()` for why
-        const k = try store.alloc.dupe(u8, key);
-        const e = try store.alloc.dupe(u8, element);
+        const key = try store.keys.reserve();
+        const val = try store.values.reserve();
 
-        // create new list
-        var list: std.DoublyLinkedList = .{};
+        try key.write(key_data);
+        try val.write(val_data);
 
-        // create new item
-        var item = try store.alloc.create(ListItem);
-        item.data = .{ .value = e, .expires_at = null };
-        list.append(&item.node);
-
-        const value: Value = .{ .list = .{ .linked = list, .len = 1 } };
-        try store.map.put(k, value);
-
-        return value.list.len;
+        const value: Value = .{ .string = .{ .data = val } };
+        // BUG
+        // Using key_data here is a very subtle bug that invalidates
+        // the ability of the map to make a correct association.
+        // It has to do with how the connection pool reuses connection buffers
+        // between subsequent requests. (I think.) Need to diagram it out
+        // and document it in the writeup.
+        store.map.putAssumeCapacity(key_data, .{ .key = key, .value = value });
     }
 
-    // lrange
-    // copies the list (if exists) out using the given allocator
-    // this prevents returning pointers directly into the map
-    // (similar to get)
-    pub fn lrange(store: *Store, alloc: std.mem.Allocator, key: Key, start: isize, stop: isize) !AllocatedList {
-        store.rw.lockShared();
-        defer store.rw.unlockShared();
+    pub fn get(store: *Store, key: []const u8) ?[]const u8 {
+        const entry: Entry = store.map.get(key) orelse return null;
+        const value = entry.value;
 
-        var copied = AllocatedList.init();
-        errdefer copied.deinit(alloc);
-
-        if (start > 0 and stop > 0 and start > stop) {
-            // cannot index, return empty
-            return copied;
-        }
-
-        const exists = store.map.get(key);
-        if (exists) |entry| {
-            assert(std.meta.activeTag(entry) == .list);
-            const length = entry.list.len;
-
-            const i_start: usize = start: {
-                if (start >= length) {
-                    // cannot index, return empty
-                    return copied;
-                }
-
-                if (start < 0) {
-                    if (@abs(start) >= length) {
-                        // trying to subtract past the length of the list
-                        // force to 0
-                        break :start 0;
-                    }
-
-                    break :start (length - @abs(start));
-                }
-
-                break :start @as(usize, @abs(start));
-            };
-
-            const i_stop: usize = stop: {
-                // if stop is >= length of array, don't index past the array length
-                if (stop >= length) {
-                    break :stop length;
-                }
-
-                if (stop < 0) {
-                    if (@abs(stop) >= length) {
-                        // trying to subtract past the length of the list
-                        // force to 0
-                        break :stop 0;
-                    }
-
-                    break :stop (length - @abs(stop));
-                }
-
-                break :stop @as(usize, @abs(stop));
-            };
-
-            const list = entry.list.linked;
-            var current = list.first;
-            var i: usize = 0;
-            while (current) |node| {
-                if (i_start <= i and i <= i_stop) {
-                    const item: *ListItem = @fieldParentPtr("node", node);
-                    const str = try alloc.dupe(u8, item.data.value);
-                    try copied.list.append(alloc, .{ .value = str, .expires_at = null });
-                }
-
-                current = node.next;
-                i += 1;
-            }
-        }
-
-        return copied;
+        // TODO(nickmond) this asserts the value stored at key is a string
+        // we need to return an error if it's a list
+        // or... we handle all that at the command "protocol" level and just
+        // faithfully return values stored in this map
+        return value.string.data.slice();
     }
 
-    // llen
-    pub fn llen(store: *Store, key: Key) usize {
-        store.rw.lockShared();
-        defer store.rw.unlockShared();
+    pub fn remove(store: *Store, key: []const u8) bool {
+        const kv = store.map.fetchRemove(key) orelse return false;
 
-        const exists = store.map.get(key);
-        if (exists) |entry| {
-            assert(std.meta.activeTag(entry) == .list);
-            return entry.list.len;
-        }
+        // TODO(nickmonad) handle removal of lists as well
 
-        return 0;
-    }
+        store.keys.release(@constCast(kv.value.key));
+        store.values.release(@constCast(kv.value.value.string.data));
 
-    // lpop
-    pub fn lpop(store: *Store, alloc: std.mem.Allocator, key: Key, count: usize) !?AllocatedList {
-        store.rw.lock();
-        defer store.rw.unlock();
-
-        const exists = store.map.getPtr(key);
-        if (exists) |entry| {
-            assert(std.meta.activeTag(entry.*) == .list);
-
-            // prepare to copy elements out of list
-            var copied = AllocatedList.init();
-            errdefer copied.deinit(alloc);
-
-            for (0..count) |_| {
-                if (entry.list.linked.popFirst()) |node| {
-                    const item: *ListItem = @fieldParentPtr("node", node);
-                    const str = try alloc.dupe(u8, item.data.value);
-                    try copied.list.append(alloc, .{ .value = str, .expires_at = null });
-
-                    store.alloc.free(item.data.value);
-                    store.alloc.destroy(item);
-
-                    entry.list.len -= 1;
-                }
-            }
-
-            return copied;
-        }
-
-        return null;
-    }
-
-    pub fn deinit(store: *Store) void {
-        store.rw.lock();
-        defer store.rw.unlock();
-
-        var iter = store.map.iterator();
-        while (iter.next()) |entry| {
-            // free key
-            store.alloc.free(entry.key_ptr.*);
-
-            // free all values
-            const v = entry.value_ptr.*;
-            switch (std.meta.activeTag(v)) {
-                .string => store.alloc.free(v.string.value),
-                .list => {
-                    var node = v.list.linked.first;
-                    while (node) |n| {
-                        // free inner string
-                        const item: *ListItem = @fieldParentPtr("node", n);
-                        node = n.next;
-
-                        store.alloc.free(item.data.value);
-                        store.alloc.destroy(item);
-                    }
-                },
-            }
-        }
-
-        store.map.deinit();
+        return true;
     }
 };
 
@@ -366,337 +176,43 @@ pub const MockTimer = struct {
     }
 };
 
-test "basic set and get" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    var time = MockTimer{};
-    var timer = Timer{ .mock = &time };
+test "basic usage" {
+    const alloc = std.testing.allocator;
 
-    var store = Store.init(alloc, &timer);
-    defer store.deinit();
-
-    // simple, no expire
-    try store.set("a", "zig", .{});
-    const a = try store.get(alloc, "a");
-    defer alloc.free(a.?.value);
-    try testing.expectEqualDeep(
-        String{ .value = "zig", .expires_at = null },
-        a.?,
-    );
-
-    // expire
-    try store.set("b", "expires", .{ .expires_in = 100 });
-    const b = try store.get(alloc, "b");
-    defer alloc.free(b.?.value);
-
-    try testing.expectEqualDeep(
-        String{ .value = "expires", .expires_at = 100 },
-        b.?,
-    );
-
-    // ...advance time
-    time.current = 200;
-    try testing.expectEqualDeep(
-        null,
-        try store.get(alloc, "b"),
-    );
-}
-
-test "rpush new list, 1 element" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
     var mock = MockTimer{};
     var timer = Timer{ .mock = &mock };
 
-    var store = Store.init(alloc, &timer);
-    defer store.deinit();
+    var store = try Store.init(alloc, 1, &timer);
+    defer store.deinit(alloc);
 
-    try std.testing.expectEqual(1, try store.rpush("new", "zig"));
-    try std.testing.expectEqual(1, try store.rpush("another", "zig"));
+    try store.set("zig", "test", .{});
+    const value = store.get("zig").?;
+
+    try std.testing.expectEqualSlices(u8, "test", value);
+    try std.testing.expect(store.remove("zig"));
 }
 
-test "rpush existing list, 1 element" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
+test "this flow fails during integration" {
+    const alloc = std.testing.allocator;
+
     var mock = MockTimer{};
     var timer = Timer{ .mock = &mock };
 
-    var store = Store.init(alloc, &timer);
-    defer store.deinit();
+    var store = try Store.init(alloc, 1024, &timer);
+    defer store.deinit(alloc);
 
-    // create existing list
-    try std.testing.expectEqual(1, try store.rpush("new", "zig"));
+    ////
 
-    // append to list
-    try std.testing.expectEqual(2, try store.rpush("new", "test"));
-}
+    try store.set("one", "aaa", .{});
+    try std.testing.expectEqualSlices(u8, "aaa", store.get("one").?);
 
-test "lpush new list, 1 element" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    var mock = MockTimer{};
-    var timer = Timer{ .mock = &mock };
+    try store.set("two", "bbb", .{});
+    try std.testing.expectEqualSlices(u8, "bbb", store.get("two").?);
 
-    var store = Store.init(alloc, &timer);
-    defer store.deinit();
+    try std.testing.expectEqualSlices(u8, "aaa", store.get("one").?);
+    try std.testing.expectEqualSlices(u8, "bbb", store.get("two").?);
+    try std.testing.expectEqualSlices(u8, "bbb", store.get("two").?);
 
-    try std.testing.expectEqual(1, try store.lpush("new", "zig"));
-    try std.testing.expectEqual(1, try store.lpush("another", "zig"));
-}
-
-test "lpush existing list, 1 element" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    var mock = MockTimer{};
-    var timer = Timer{ .mock = &mock };
-
-    var store = Store.init(alloc, &timer);
-    defer store.deinit();
-
-    // create existing list
-    try std.testing.expectEqual(1, try store.lpush("new", "zig"));
-
-    // append to list
-    try std.testing.expectEqual(2, try store.lpush("new", "test"));
-}
-
-test "lrange (rpush) list does not exist" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    var mock = MockTimer{};
-    var timer = Timer{ .mock = &mock };
-
-    var store = Store.init(alloc, &timer);
-    defer store.deinit();
-
-    const expected = AllocatedList.init();
-    const actual = try store.lrange(alloc, "nope", 0, 10);
-
-    try std.testing.expectEqual(expected, actual);
-}
-
-test "lrange (rpush) list exists" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    var mock = MockTimer{};
-    var timer = Timer{ .mock = &mock };
-
-    var store = Store.init(alloc, &timer);
-    defer store.deinit();
-
-    _ = try store.rpush("list", "a");
-    _ = try store.rpush("list", "b");
-    _ = try store.rpush("list", "c");
-
-    var expected = AllocatedList.init();
-    // NOTE: deinit the underlying list directly in tests
-    // If we don't, we segfault trying to dealloc the `.value` items below
-    // (since they are statically initialized)
-    defer expected.list.deinit(alloc);
-
-    try expected.list.append(alloc, .{ .value = "a", .expires_at = null });
-    try expected.list.append(alloc, .{ .value = "b", .expires_at = null });
-    try expected.list.append(alloc, .{ .value = "c", .expires_at = null });
-
-    var inrange = try store.lrange(alloc, "list", 0, 2);
-    var outrange = try store.lrange(alloc, "list", 0, 3);
-    var wayoutrange = try store.lrange(alloc, "list", 0, 100);
-    // NOTE: These are safe to deinit/dealloc, as they are dynamically allocated in lrange()
-    defer inrange.deinit(alloc);
-    defer outrange.deinit(alloc);
-    defer wayoutrange.deinit(alloc);
-
-    try std.testing.expectEqualDeep(expected, inrange);
-    try std.testing.expectEqualDeep(expected, outrange);
-    try std.testing.expectEqualDeep(expected, wayoutrange);
-}
-
-test "lrange (rpush) weird start and stop" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    var mock = MockTimer{};
-    var timer = Timer{ .mock = &mock };
-
-    var store = Store.init(alloc, &timer);
-    defer store.deinit();
-
-    var expected = AllocatedList.init();
-    defer expected.list.deinit(alloc);
-
-    // start > stop
-    try std.testing.expectEqualDeep(expected, try store.lrange(alloc, "list", 1, 0));
-    try std.testing.expectEqualDeep(expected, try store.lrange(alloc, "list", 100, 99));
-
-    // start == stop, empty
-    var empty = try store.lrange(alloc, "list", 0, 0);
-    defer empty.deinit(alloc);
-    try std.testing.expectEqualDeep(expected, empty);
-
-    // start == stop, multiple elements
-    _ = try store.rpush("list", "a");
-    _ = try store.rpush("list", "b");
-    _ = try store.rpush("list", "c");
-
-    try expected.list.append(alloc, .{ .value = "a", .expires_at = null });
-    var one_element = try store.lrange(alloc, "list", 0, 0);
-    defer one_element.deinit(alloc);
-
-    try std.testing.expectEqualDeep(expected, one_element);
-}
-
-test "lrange (rpush) negative start and stop" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    var mock = MockTimer{};
-    var timer = Timer{ .mock = &mock };
-
-    var store = Store.init(alloc, &timer);
-    defer store.deinit();
-
-    var expected = AllocatedList.init();
-    defer expected.list.deinit(alloc);
-
-    // negative, empty
-    try std.testing.expectEqualDeep(expected, try store.lrange(alloc, "list", -10, -10));
-    try std.testing.expectEqualDeep(expected, try store.lrange(alloc, "list", -10, -5));
-    try std.testing.expectEqualDeep(expected, try store.lrange(alloc, "list", -10, 0));
-    try std.testing.expectEqualDeep(expected, try store.lrange(alloc, "list", 0, -3));
-
-    // ... add list elements
-    _ = try store.rpush("list", "a");
-    _ = try store.rpush("list", "b");
-    _ = try store.rpush("list", "c");
-    _ = try store.rpush("list", "d");
-
-    try expected.list.append(alloc, .{ .value = "a", .expires_at = null });
-    try expected.list.append(alloc, .{ .value = "b", .expires_at = null });
-    try expected.list.append(alloc, .{ .value = "c", .expires_at = null });
-    try expected.list.append(alloc, .{ .value = "d", .expires_at = null });
-
-    var test1 = try store.lrange(alloc, "list", -1, -1);
-    defer test1.deinit(alloc);
-    try std.testing.expectEqualDeep(expected.list.items[3..4], test1.list.items);
-
-    var test2 = try store.lrange(alloc, "list", -2, -1);
-    defer test2.deinit(alloc);
-    try std.testing.expectEqualDeep(expected.list.items[2..4], test2.list.items);
-
-    var test3 = try store.lrange(alloc, "list", 0, -3);
-    defer test3.deinit(alloc);
-    try std.testing.expectEqualDeep(expected.list.items[0..2], test3.list.items);
-
-    var test4 = try store.lrange(alloc, "list", 0, -1);
-    defer test4.deinit(alloc);
-    try std.testing.expectEqualDeep(expected.list.items[0..4], test4.list.items);
-}
-
-test "lrange (lpush)" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    var mock = MockTimer{};
-    var timer = Timer{ .mock = &mock };
-
-    var store = Store.init(alloc, &timer);
-    defer store.deinit();
-
-    var expected = AllocatedList.init();
-    defer expected.list.deinit(alloc);
-
-    // negative, empty
-    try std.testing.expectEqualDeep(expected, try store.lrange(alloc, "list", -10, -10));
-    try std.testing.expectEqualDeep(expected, try store.lrange(alloc, "list", -10, -5));
-    try std.testing.expectEqualDeep(expected, try store.lrange(alloc, "list", -10, 0));
-    try std.testing.expectEqualDeep(expected, try store.lrange(alloc, "list", 0, -3));
-
-    // ... add list elements
-    _ = try store.lpush("list", "a");
-    _ = try store.lpush("list", "b");
-    _ = try store.lpush("list", "c");
-    _ = try store.lpush("list", "d");
-
-    try expected.list.append(alloc, .{ .value = "d", .expires_at = null });
-    try expected.list.append(alloc, .{ .value = "c", .expires_at = null });
-    try expected.list.append(alloc, .{ .value = "b", .expires_at = null });
-    try expected.list.append(alloc, .{ .value = "a", .expires_at = null });
-
-    var test1 = try store.lrange(alloc, "list", -1, -1);
-    defer test1.deinit(alloc);
-    try std.testing.expectEqualDeep(expected.list.items[3..4], test1.list.items);
-
-    var test2 = try store.lrange(alloc, "list", -2, -1);
-    defer test2.deinit(alloc);
-    try std.testing.expectEqualDeep(expected.list.items[2..4], test2.list.items);
-
-    var test3 = try store.lrange(alloc, "list", 0, -3);
-    defer test3.deinit(alloc);
-    try std.testing.expectEqualDeep(expected.list.items[0..2], test3.list.items);
-
-    var test4 = try store.lrange(alloc, "list", 0, -1);
-    defer test4.deinit(alloc);
-    try std.testing.expectEqualDeep(expected.list.items[0..4], test4.list.items);
-}
-
-test "llen" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    var mock = MockTimer{};
-    var timer = Timer{ .mock = &mock };
-
-    var store = Store.init(alloc, &timer);
-    defer store.deinit();
-
-    // empty list
-    try std.testing.expectEqual(0, store.llen("list"));
-
-    // ... add list elements
-    _ = try store.lpush("list", "a");
-    try std.testing.expectEqual(1, store.llen("list"));
-
-    _ = try store.lpush("list", "a");
-    _ = try store.lpush("list", "a");
-    try std.testing.expectEqual(3, store.llen("list"));
-
-    _ = try store.rpush("list", "a");
-    _ = try store.rpush("list", "a");
-    try std.testing.expectEqual(5, store.llen("list"));
-}
-
-test "lpop" {
-    const testing = std.testing;
-    const alloc = testing.allocator;
-    var mock = MockTimer{};
-    var timer = Timer{ .mock = &mock };
-
-    var store = Store.init(alloc, &timer);
-    defer store.deinit();
-
-    _ = try store.rpush("list", "a");
-    _ = try store.rpush("list", "b");
-    _ = try store.rpush("list", "c");
-    _ = try store.rpush("list", "d");
-
-    var expected = AllocatedList.init();
-    defer expected.list.deinit(alloc);
-
-    // count = 0, return empty
-    var empty = try store.lpop(alloc, "list", 0);
-    defer empty.?.deinit(alloc);
-    try std.testing.expectEqualDeep(expected, empty);
-
-    // count = 1
-    try expected.list.append(alloc, .{ .value = "a", .expires_at = null });
-    var count1 = try store.lpop(alloc, "list", 1);
-    defer count1.?.deinit(alloc);
-
-    try std.testing.expectEqualDeep(expected, count1.?);
-    try std.testing.expectEqual(3, store.llen("list"));
-
-    // count = 2
-    expected.list.clearAndFree(alloc);
-    try expected.list.append(alloc, .{ .value = "b", .expires_at = null });
-    try expected.list.append(alloc, .{ .value = "c", .expires_at = null });
-    var count2 = try store.lpop(alloc, "list", 2);
-    defer count2.?.deinit(alloc);
-
-    try std.testing.expectEqualDeep(expected, count2.?);
+    try store.set("one", "aaa", .{});
+    try std.testing.expectEqualSlices(u8, "aaa", store.get("one").?);
 }

@@ -247,9 +247,11 @@ const Server = struct {
         defer server.fba.reset();
 
         // TODO(nickmonad) handle parsing error
+        // std.debug.print("parsing = {s}\n", .{connection.recv_buffer.buf[0..read]});
         var cmd = command.parse(alloc, connection.recv_buffer.buf[0..read]) catch unreachable;
         cmd.do(alloc, server.kv, &output) catch unreachable;
 
+        // std.debug.print("sending = {s}\n", .{connection.send_buffer.buf[0..output.buffered().len]});
         connection.completion.operation = .{
             .send = .{
                 .socket = connection.client,
@@ -306,10 +308,9 @@ pub fn main() !void {
     var system = SystemTimer{};
     var timer = Timer{ .system = &system };
 
-    // TODO(nickmonad)
-    // use an allocator with upper bound for store, make configurable
-    var kv = Store.init(gpa.allocator(), &timer);
-    defer kv.deinit();
+    // TODO(nickmonad) config store size
+    var kv = try Store.init(gpa.allocator(), 1024, &timer);
+    defer kv.deinit(gpa.allocator());
 
     // TODO(nickmonad)
     // handle graceful shutdown from SIGTERM

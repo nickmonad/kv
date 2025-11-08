@@ -12,6 +12,7 @@ pub const Buffer = struct {
     // internal
     next: ?*Buffer = null,
     reserved: bool = false,
+    owner: ?*BufferPool = null,
 
     pub fn write(buffer: *Buffer, data: []const u8) error{OutOfMemory}!void {
         assert(buffer.reserved);
@@ -67,6 +68,10 @@ pub const BufferPool = struct {
         if (pool.free) |buffer| {
             pool.free = buffer.next;
 
+            assert(buffer.len == 0);
+            assert(!buffer.reserved);
+
+            buffer.owner = pool;
             buffer.next = null;
             buffer.reserved = true;
 
@@ -77,8 +82,12 @@ pub const BufferPool = struct {
     }
 
     pub fn release(pool: *BufferPool, buffer: *Buffer) void {
+        assert(buffer.owner == pool);
+
+        buffer.len = 0;
         buffer.reserved = false;
         buffer.next = pool.free;
+
         pool.free = buffer;
     }
 };
