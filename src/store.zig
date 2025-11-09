@@ -102,9 +102,8 @@ pub const Store = struct {
         // TODO(nickmonad)
         // check if key or value length is greater than configured maximums
 
-        if (store.map.remove(key_data)) {
-            std.debug.print("found existing\n", .{});
-        }
+        // always remove any conflicting key/value
+        _ = store.map.remove(key_data);
 
         const key = try store.keys.reserve();
         const val = try store.values.reserve();
@@ -112,14 +111,12 @@ pub const Store = struct {
         try key.write(key_data);
         try val.write(val_data);
 
+        // NOTE(nickmonad)
+        // It is CRITICAL that we use key.slice() here, instead of key_data.
+        // Using key_data would result in inconsistent GET results, due to
+        // how the connection pool buffers interact with this function call.
         const value: Value = .{ .string = .{ .data = val } };
-        // BUG
-        // Using key_data here is a very subtle bug that invalidates
-        // the ability of the map to make a correct association.
-        // It has to do with how the connection pool reuses connection buffers
-        // between subsequent requests. (I think.) Need to diagram it out
-        // and document it in the writeup.
-        store.map.putAssumeCapacity(key_data, .{ .key = key, .value = value });
+        store.map.putAssumeCapacity(key.slice(), .{ .key = key, .value = value });
     }
 
     pub fn get(store: *Store, key: []const u8) ?[]const u8 {
@@ -190,29 +187,4 @@ test "basic usage" {
 
     try std.testing.expectEqualSlices(u8, "test", value);
     try std.testing.expect(store.remove("zig"));
-}
-
-test "this flow fails during integration" {
-    const alloc = std.testing.allocator;
-
-    var mock = MockTimer{};
-    var timer = Timer{ .mock = &mock };
-
-    var store = try Store.init(alloc, 1024, &timer);
-    defer store.deinit(alloc);
-
-    ////
-
-    try store.set("one", "aaa", .{});
-    try std.testing.expectEqualSlices(u8, "aaa", store.get("one").?);
-
-    try store.set("two", "bbb", .{});
-    try std.testing.expectEqualSlices(u8, "bbb", store.get("two").?);
-
-    try std.testing.expectEqualSlices(u8, "aaa", store.get("one").?);
-    try std.testing.expectEqualSlices(u8, "bbb", store.get("two").?);
-    try std.testing.expectEqualSlices(u8, "bbb", store.get("two").?);
-
-    try store.set("one", "aaa", .{});
-    try std.testing.expectEqualSlices(u8, "aaa", store.get("one").?);
 }

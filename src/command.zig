@@ -218,11 +218,6 @@ const SET = struct {
 
     fn do(cmd: SET, out: *Writer, kv: *Store) !void {
         try kv.set(cmd.key, cmd.value, .{ .expires_in = cmd.expires_in });
-
-        std.debug.print("SET debug() map state\n", .{});
-        kv.debug();
-        std.debug.print("-----------------\n", .{});
-
         return out.print(OK, .{});
     }
 };
@@ -236,17 +231,8 @@ const GET = struct {
     }
 
     fn do(cmd: GET, out: *Writer, kv: *Store) !void {
-        const value = kv.get(cmd.key);
-
-        std.debug.print("GET debug() map state\n", .{});
-        kv.debug();
-        std.debug.print("-----------------\n", .{});
-
-        if (value) |v| {
-            return BulkString.encode(out, v);
-        }
-
-        return out.print(NULL, .{});
+        const value = kv.get(cmd.key) orelse return out.print(NULL, .{});
+        return BulkString.encode(out, value);
     }
 };
 

@@ -247,11 +247,9 @@ const Server = struct {
         defer server.fba.reset();
 
         // TODO(nickmonad) handle parsing error
-        // std.debug.print("parsing = {s}\n", .{connection.recv_buffer.buf[0..read]});
         var cmd = command.parse(alloc, connection.recv_buffer.buf[0..read]) catch unreachable;
         cmd.do(alloc, server.kv, &output) catch unreachable;
 
-        // std.debug.print("sending = {s}\n", .{connection.send_buffer.buf[0..output.buffered().len]});
         connection.completion.operation = .{
             .send = .{
                 .socket = connection.client,
