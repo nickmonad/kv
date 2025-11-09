@@ -6,8 +6,9 @@ pub const Buffer = struct {
     // use write(), do not set directly!
     buf: []u8 = undefined,
 
-    // length of the written content
-    len: usize = 0,
+    // used length of the written content
+    // separate from the buf.len, which is the total available space
+    used: usize = 0,
 
     // internal
     next: ?*Buffer = null,
@@ -25,11 +26,11 @@ pub const Buffer = struct {
         }
 
         @memcpy(buffer.buf[0..data.len], data);
-        buffer.len = data.len;
+        buffer.used = data.len;
     }
 
     pub fn slice(buffer: *const Buffer) []const u8 {
-        return buffer.buf[0..buffer.len];
+        return buffer.buf[0..buffer.used];
     }
 };
 
@@ -68,7 +69,7 @@ pub const BufferPool = struct {
         if (pool.free) |buffer| {
             pool.free = buffer.next;
 
-            assert(buffer.len == 0);
+            assert(buffer.used == 0);
             assert(!buffer.reserved);
 
             buffer.owner = pool;
@@ -84,7 +85,7 @@ pub const BufferPool = struct {
     pub fn release(pool: *BufferPool, buffer: *Buffer) void {
         assert(buffer.owner == pool);
 
-        buffer.len = 0;
+        buffer.used = 0;
         buffer.reserved = false;
         buffer.next = pool.free;
 
@@ -148,16 +149,16 @@ test "buffer write" {
     defer pool.release(buffer);
 
     try buffer.write("test");
-    try std.testing.expectEqual(4, buffer.len);
+    try std.testing.expectEqual(4, buffer.used);
     try std.testing.expectEqualSlices(u8, "test", buffer.slice());
 
     try buffer.write("overwrite");
-    try std.testing.expectEqual(9, buffer.len);
+    try std.testing.expectEqual(9, buffer.used);
     try std.testing.expectEqualSlices(u8, "overwrite", buffer.slice());
 
     const max: [buffer_size]u8 = @splat('a');
     try buffer.write(&max);
-    try std.testing.expectEqual(1024, buffer.len);
+    try std.testing.expectEqual(1024, buffer.used);
 
     const overflow: [buffer_size + 1]u8 = @splat('a');
     try std.testing.expectError(error.OutOfMemory, buffer.write(&overflow));
