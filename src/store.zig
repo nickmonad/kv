@@ -5,14 +5,20 @@ const buffer_pool = @import("./buffer_pool.zig");
 const Buffer = buffer_pool.Buffer;
 const BufferPool = buffer_pool.BufferPool;
 
-const Entry = struct {
-    // associate value with key
-    // so that we can free it as needed
+/// Direct value type referenced by the internal hash map.
+/// As far as lookups go, this is all the hash map cares about storing.
+/// We call this "Value" so it aligns well with the attributes of
+/// structures returned by the hash map. (i.e. "value_ptr", etc)
+const Value = struct {
+    // Store a reference to the key, so it can be free'd when
+    // this value is removed from the map.
     key: *const Buffer,
-    value: Value,
+    inner: InnerValue,
 };
 
-const Value = union(enum) {
+/// This is the "logical" value our application cares about.
+/// Each key can refer to either a standalone "string" or a list of those.
+const InnerValue = union(enum) {
     string: String,
     list: List,
 };
@@ -28,22 +34,24 @@ const List = struct {
 
 const ListItem = struct {
     node: std.DoublyLinkedList.Node,
-    data: String,
+    string: String,
 };
-
-pub const PushDirection = enum { left, right };
 
 pub const SetOptions = struct {
     expires_in: ?i64 = null, // milliseconds, type defined by std.time
 };
 
 pub const Store = struct {
-    map: std.StringHashMapUnmanaged(Entry),
+    pub const PushDirection = enum { left, right };
+
+    const ListItemPool = std.heap.MemoryPoolExtra(ListItem, .{ .growable = false });
+
+    map: std.StringHashMapUnmanaged(Value),
 
     keys: BufferPool,
     values: BufferPool,
 
-    timer: *Timer,
+    list_items: ListItemPool,
 
     /// Initialize the Store with a given number of keys.
     /// Space for keys will be allocated, along with space of values.
@@ -51,28 +59,35 @@ pub const Store = struct {
     /// This is to ensure that the number of _associations_ of key to value can be closer
     /// to what is configured here as `size`, in the event a handful of keys allocate many
     /// values as part of a list.
-    pub fn init(gpa: std.mem.Allocator, size: u32, timer: *Timer) error{OutOfMemory}!Store {
+    pub fn init(gpa: std.mem.Allocator, size: u32) error{OutOfMemory}!Store {
         const num_keys = size;
         const num_vals = num_keys * 2;
 
-        var map: std.StringHashMapUnmanaged(Entry) = .empty;
+        var map: std.StringHashMapUnmanaged(Value) = .empty;
         try map.ensureTotalCapacity(gpa, num_keys);
 
         // TODO(nickmonad) config
         const keys = try BufferPool.init(gpa, num_keys, 1024);
         const values = try BufferPool.init(gpa, num_vals, 1024);
 
+        // Create a pool of list items for list values.
+        // In practice, we may get really poor utilization of this allocated space,
+        // if our storage is heavy on single string values. Ideally, our static allocation
+        // could share more space with other data types, but we aren't smart enough for that yet.
+        const list_items = try ListItemPool.initPreheated(gpa, num_vals);
+
         return .{
             .map = map,
             .keys = keys,
             .values = values,
-            .timer = timer,
+            .list_items = list_items,
         };
     }
 
     pub fn deinit(store: *Store, gpa: std.mem.Allocator) void {
-        store.keys.deinit();
+        store.list_items.deinit();
         store.values.deinit();
+        store.keys.deinit();
 
         store.map.deinit(gpa);
     }
@@ -91,13 +106,17 @@ pub const Store = struct {
         }
     }
 
-    pub fn set(store: *Store, key_data: []const u8, val_data: []const u8, _: SetOptions) error{OutOfMemory}!void {
+    fn has_availability(store: *Store) error{OutOfMemory}!void {
         if (store.map.available == 0) {
             // while the map _technically_ has capacity, we can't associate
             // any more keys beyond the configured load factor, as we risk
             // a full scan on a hash conflict
             return error.OutOfMemory;
         }
+    }
+
+    pub fn set(store: *Store, key_data: []const u8, val_data: []const u8, _: SetOptions) error{OutOfMemory}!void {
+        try store.has_availability();
 
         // TODO(nickmonad)
         // check if key or value length is greater than configured maximums
@@ -115,71 +134,91 @@ pub const Store = struct {
         // It is CRITICAL that we use key.slice() here, instead of key_data.
         // Using key_data would result in inconsistent GET results, due to
         // how the connection pool buffers interact with this function call.
-        const value: Value = .{ .string = .{ .data = val } };
-        store.map.putAssumeCapacity(key.slice(), .{ .key = key, .value = value });
+        const inner: InnerValue = .{ .string = .{ .data = val } };
+        store.map.putAssumeCapacity(key.slice(), .{ .key = key, .inner = inner });
     }
 
     pub fn get(store: *Store, key: []const u8) ?[]const u8 {
-        const entry: Entry = store.map.get(key) orelse return null;
-        const value = entry.value;
+        const value: Value = store.map.get(key) orelse return null;
+        const inner = value.inner;
 
         // TODO(nickmond) this asserts the value stored at key is a string
         // we need to return an error if it's a list
         // or... we handle all that at the command "protocol" level and just
         // faithfully return values stored in this map
-        return value.string.data.slice();
+        return inner.string.data.slice();
+    }
+
+    pub fn push(store: *Store, direction: PushDirection, key_data: []const u8, element: []const u8) error{ OutOfMemory, InvalidDataType }!usize {
+        try store.has_availability();
+
+        const exists = store.map.getPtr(key_data);
+        if (exists) |value| {
+            // ensure key stores a list
+            if (std.meta.activeTag(value.inner) != .list) {
+                return error.InvalidDataType;
+            }
+
+            const val = try store.values.reserve();
+            try val.write(element);
+
+            var item = try store.list_items.create();
+            item.string = .{ .data = val };
+
+            switch (direction) {
+                .left => value.inner.list.linked.prepend(&item.node),
+                .right => value.inner.list.linked.append(&item.node),
+            }
+
+            value.inner.list.len += 1;
+            return value.inner.list.len;
+        }
+
+        // list does not exist
+        // create a new item and append it to a new list
+        const key = try store.keys.reserve();
+        const val = try store.values.reserve();
+
+        try key.write(key_data);
+        try val.write(element);
+
+        var item = try store.list_items.create();
+        item.string = .{ .data = val };
+
+        var list: List = .{ .linked = .{}, .len = 1 };
+        list.linked.append(&item.node);
+
+        store.map.putAssumeCapacity(key.slice(), .{ .key = key, .inner = .{ .list = list } });
+        return list.len;
     }
 
     pub fn remove(store: *Store, key: []const u8) bool {
         const kv = store.map.fetchRemove(key) orelse return false;
+        switch (kv.value.inner) {
+            .string => |string| {
+                store.values.release(@constCast(string.data));
+            },
+            .list => |list| {
+                var node = list.linked.first;
+                while (node) |n| {
+                    const item: *ListItem = @fieldParentPtr("node", n);
+                    node = n.next;
 
-        // TODO(nickmonad) handle removal of lists as well
+                    store.values.release(@constCast(item.string.data));
+                    store.list_items.destroy(item);
+                }
+            },
+        }
 
         store.keys.release(@constCast(kv.value.key));
-        store.values.release(@constCast(kv.value.value.string.data));
-
         return true;
-    }
-};
-
-pub const TimerType = enum {
-    system,
-    mock,
-};
-
-pub const Timer = union(TimerType) {
-    system: *SystemTimer,
-    mock: *MockTimer,
-
-    pub fn getTime(timer: *Timer) i64 {
-        switch (timer.*) {
-            .system => |system| return system.getTime(),
-            .mock => |mock| return mock.getTime(),
-        }
-    }
-};
-
-pub const SystemTimer = struct {
-    pub fn getTime(_: *SystemTimer) i64 {
-        return std.time.milliTimestamp();
-    }
-};
-
-pub const MockTimer = struct {
-    current: i64 = 0,
-
-    pub fn getTime(mock: *MockTimer) i64 {
-        return mock.current;
     }
 };
 
 test "basic usage" {
     const alloc = std.testing.allocator;
 
-    var mock = MockTimer{};
-    var timer = Timer{ .mock = &mock };
-
-    var store = try Store.init(alloc, 1, &timer);
+    var store = try Store.init(alloc, 1);
     defer store.deinit(alloc);
 
     try store.set("zig", "test", .{});
@@ -187,4 +226,33 @@ test "basic usage" {
 
     try std.testing.expectEqualSlices(u8, "test", value);
     try std.testing.expect(store.remove("zig"));
+}
+
+test "push, 1 element" {
+    const alloc = std.testing.allocator;
+
+    var store = try Store.init(alloc, 2);
+    defer store.deinit(alloc);
+
+    try std.testing.expectEqual(1, try store.push(.right, "new", "test"));
+    try std.testing.expectEqual(1, try store.push(.right, "just", "testing"));
+}
+
+test "push, multiple elements" {
+    const alloc = std.testing.allocator;
+
+    var store = try Store.init(alloc, 10);
+    defer store.deinit(alloc);
+
+    try std.testing.expectEqual(1, try store.push(.right, "just", "testing"));
+
+    try std.testing.expectEqual(1, try store.push(.right, "list", "a"));
+    try std.testing.expectEqual(2, try store.push(.right, "list", "b"));
+    try std.testing.expectEqual(3, try store.push(.right, "list", "c"));
+    try std.testing.expectEqual(4, try store.push(.right, "list", "d"));
+    try std.testing.expectEqual(5, try store.push(.right, "list", "e"));
+    try std.testing.expectEqual(6, try store.push(.left, "list", "f"));
+    try std.testing.expectEqual(7, try store.push(.left, "list", "g"));
+    try std.testing.expectEqual(8, try store.push(.left, "list", "h"));
+    try std.testing.expectEqual(9, try store.push(.left, "list", "i"));
 }

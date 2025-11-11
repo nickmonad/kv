@@ -18,8 +18,6 @@ const BufferPool = buffer_pool.BufferPool;
 const command = @import("command.zig");
 const store = @import("store.zig");
 const Store = store.Store;
-const SystemTimer = store.SystemTimer;
-const Timer = store.Timer;
 
 const PORT = 6379;
 const IO_URING_ENTIRES = 1024;
@@ -303,11 +301,8 @@ pub fn main() !void {
     var pool = try ConnectionPool.init(gpa.allocator(), 10);
     defer pool.deinit();
 
-    var system = SystemTimer{};
-    var timer = Timer{ .system = &system };
-
     // TODO(nickmonad) config store size
-    var kv = try Store.init(gpa.allocator(), 1024, &timer);
+    var kv = try Store.init(gpa.allocator(), 1024);
     defer kv.deinit(gpa.allocator());
 
     // TODO(nickmonad)

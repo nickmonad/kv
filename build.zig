@@ -38,6 +38,15 @@ pub fn build(b: *std.Build) void {
     // step when running `zig build`).
     b.installArtifact(exe);
 
+    // For ZLS
+    const exe_check = b.addExecutable(.{
+        .name = "kv",
+        .root_module = exe_mod,
+    });
+
+    const check = b.step("check", "check if kv compiles");
+    check.dependOn(&exe_check.step);
+
     // This *creates* a Run step in the build graph, to be executed when another
     // step is evaluated that depends on it. The next line below will establish
     // such a dependency.
@@ -73,4 +82,3 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);
 }
-
