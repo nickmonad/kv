@@ -28,7 +28,7 @@ const CommandName = enum {
     rpush,
     lpush,
     lrange,
-    // llen,
+    llen,
     // lpop,
 };
 
@@ -40,7 +40,7 @@ const Command = union(CommandName) {
     rpush: PUSH,
     lpush: PUSH,
     lrange: LRANGE,
-    // llen: LLEN,
+    llen: LLEN,
     // lpop: LPOP,
 
     pub fn do(command: *Command, alloc: std.mem.Allocator, kv: *Store, out: *Writer) !void {
@@ -51,7 +51,7 @@ const Command = union(CommandName) {
             .get => |get| return get.do(out, kv),
             .rpush, .lpush => |push| return push.do(out, kv),
             .lrange => |lrange| return lrange.do(alloc, out, kv),
-            // .llen => |llen| return llen.do(out, kv),
+            .llen => |llen| return llen.do(out, kv),
             // .lpop => |lpop| return lpop.do(alloc, out, kv),
         }
     }
@@ -89,7 +89,7 @@ pub fn parse(alloc: std.mem.Allocator, buf: []const u8) !Command {
         .rpush => return Command{ .rpush = try PUSH.parse(alloc, &iter, .right) },
         .lpush => return Command{ .lpush = try PUSH.parse(alloc, &iter, .left) },
         .lrange => return Command{ .lrange = try LRANGE.parse(&iter) },
-        // .llen => return Command{ .llen = try LLEN.parse(&iter) },
+        .llen => return Command{ .llen = try LLEN.parse(&iter) },
         // .lpop => return Command{ .lpop = try LPOP.parse(&iter) },
     }
 }
@@ -375,20 +375,31 @@ const LRANGE = struct {
         return BulkArray.encode(out, to_encode.items);
     }
 };
-//
-// const LLEN = struct {
-//     list: []const u8,
-//
-//     fn parse(iter: *ParseIterator) !LLEN {
-//         const list = iter.next() orelse return ParseError.MissingData;
-//         return .{ .list = list };
-//     }
-//
-//     fn do(cmd: LLEN, out: *Writer, kv: *Store) !void {
-//         const length = kv.llen(cmd.list);
-//         return out.print(":{d}\r\n", .{length});
-//     }
-// };
+
+const LLEN = struct {
+    list: []const u8,
+
+    fn parse(iter: *ParseIterator) !LLEN {
+        const list = iter.next() orelse return ParseError.MissingData;
+        return .{ .list = list };
+    }
+
+    fn do(cmd: LLEN, out: *Writer, kv: *Store) !void {
+        const value = kv.get(cmd.list);
+        if (value) |v| {
+            if (std.meta.activeTag(v.inner) != .list) {
+                // TODO: return WRONGTYPE error
+                return out.print(NULL, .{});
+            }
+
+            const list = v.inner.list;
+            return out.print(":{d}\r\n", .{list.len});
+        }
+
+        // no value exists under key, interpret as empty list
+        return out.print(":0\r\n", .{});
+    }
+};
 //
 // const LPOP = struct {
 //     key: []const u8,
@@ -713,21 +724,21 @@ test "parse LRANGE negative" {
     try std.testing.expectEqual(-5, parsed.lrange.stop);
 }
 
-// test "parse LLEN" {
-//     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-//     defer arena.deinit();
-//
-//     const alloc = arena.allocator();
-//
-//     var buf: [100]u8 = undefined;
-//     var w: Writer = .fixed(&buf);
-//     BA(&w, &.{ "LLEN", "test" });
-//
-//     const parsed = try parse(alloc, w.buffered());
-//
-//     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.llen);
-//     try std.testing.expectEqualSlices(u8, "test", parsed.llen.list);
-// }
+test "parse LLEN" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "LLEN", "test" });
+
+    const parsed = try parse(alloc, w.buffered());
+
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.llen);
+    try std.testing.expectEqualSlices(u8, "test", parsed.llen.list);
+}
 //
 // test "parse LPOP" {
 //     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
