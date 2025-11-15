@@ -2,6 +2,7 @@ const std = @import("std");
 const Writer = std.io.Writer;
 
 const Store = @import("store.zig").Store;
+const ListItem = @import("store.zig").ListItem;
 const PushDirection = Store.PushDirection;
 
 const encoding = @import("encoding.zig");
@@ -50,7 +51,7 @@ pub fn parse(alloc: std.mem.Allocator, buf: []const u8) !Command {
         .get => return Command{ .get = try GET.parse(&iter) },
         .rpush => return Command{ .rpush = try PUSH.parse(alloc, &iter, .right) },
         .lpush => return Command{ .lpush = try PUSH.parse(alloc, &iter, .left) },
-        // .lrange => return Command{ .lrange = try LRANGE.parse(&iter) },
+        .lrange => return Command{ .lrange = try LRANGE.parse(&iter) },
         // .llen => return Command{ .llen = try LLEN.parse(&iter) },
         // .lpop => return Command{ .lpop = try LPOP.parse(&iter) },
     }
@@ -147,7 +148,7 @@ const CommandName = enum {
     get,
     rpush,
     lpush,
-    // lrange,
+    lrange,
     // llen,
     // lpop,
 };
@@ -159,18 +160,18 @@ const Command = union(CommandName) {
     get: GET,
     rpush: PUSH,
     lpush: PUSH,
-    // lrange: LRANGE,
+    lrange: LRANGE,
     // llen: LLEN,
     // lpop: LPOP,
 
-    pub fn do(command: *Command, _: std.mem.Allocator, kv: *Store, out: *Writer) !void {
+    pub fn do(command: *Command, alloc: std.mem.Allocator, kv: *Store, out: *Writer) !void {
         switch (command.*) {
             .ping => |ping| return ping.do(out),
             .echo => |echo| return echo.do(out),
             .set => |set| return set.do(out, kv),
             .get => |get| return get.do(out, kv),
             .rpush, .lpush => |push| return push.do(out, kv),
-            // .lrange => |lrange| return lrange.do(alloc, out, kv),
+            .lrange => |lrange| return lrange.do(alloc, out, kv),
             // .llen => |llen| return llen.do(out, kv),
             // .lpop => |lpop| return lpop.do(alloc, out, kv),
         }
@@ -236,7 +237,13 @@ const GET = struct {
 
     fn do(cmd: GET, out: *Writer, kv: *Store) !void {
         const value = kv.get(cmd.key) orelse return out.print(NULL, .{});
-        return BulkString.encode(out, value);
+        const inner = value.inner;
+
+        switch (inner) {
+            .string => |s| return BulkString.encode(out, s.data.slice()),
+            // TODO return WRONGTYPE
+            else => return out.print(NULL, .{}),
+        }
     }
 };
 
@@ -275,45 +282,99 @@ const PUSH = struct {
         return out.print(":{d}\r\n", .{length});
     }
 };
-//
-// const LRANGE = struct {
-//     list: []const u8,
-//     start: isize,
-//     stop: isize,
-//
-//     fn parse(iter: *ParseIterator) !LRANGE {
-//         const list = iter.next() orelse return ParseError.MissingData;
-//         const start = try std.fmt.parseInt(isize, iter.next() orelse return ParseError.MissingData, 10);
-//         const stop = try std.fmt.parseInt(isize, iter.next() orelse return ParseError.MissingData, 10);
-//
-//         return .{
-//             .list = list,
-//             .start = start,
-//             .stop = stop,
-//         };
-//     }
-//
-//     fn do(
-//         cmd: LRANGE,
-//         alloc: std.mem.Allocator,
-//         out: *Writer,
-//         kv: *Store,
-//     ) !void {
-//         // TODO(nicmonad) again, if the Store is going to be single-threaded, we don't need
-//         // this extra allocation into the alloc...
-//         var list = try kv.lrange(alloc, cmd.list, cmd.start, cmd.stop);
-//         defer list.deinit(alloc);
-//
-//         var to_encode: std.ArrayList([]const u8) = .empty;
-//         defer to_encode.deinit(alloc);
-//
-//         for (list.list.items) |item| {
-//             try to_encode.append(alloc, item.value);
-//         }
-//
-//         return BulkArray.encode(out, to_encode.items);
-//     }
-// };
+
+const LRANGE = struct {
+    list: []const u8,
+    start: isize,
+    stop: isize,
+
+    fn parse(iter: *ParseIterator) !LRANGE {
+        const list = iter.next() orelse return ParseError.MissingData;
+        const start = try std.fmt.parseInt(isize, iter.next() orelse return ParseError.MissingData, 10);
+        const stop = try std.fmt.parseInt(isize, iter.next() orelse return ParseError.MissingData, 10);
+
+        return .{
+            .list = list,
+            .start = start,
+            .stop = stop,
+        };
+    }
+
+    fn do(
+        cmd: LRANGE,
+        alloc: std.mem.Allocator,
+        out: *Writer,
+        kv: *Store,
+    ) !void {
+        const value = kv.get(cmd.list);
+        if (value == null) {
+            return BulkArray.encode(out, &.{});
+        }
+
+        const inner = value.?.inner;
+        if (std.meta.activeTag(inner) != .list) {
+            // TODO: return WRONGTYPE
+            return out.print(NULL, .{});
+        }
+
+        const list = inner.list;
+
+        const i_start: usize = start: {
+            if (cmd.start >= list.len) {
+                return BulkArray.encode(out, &.{});
+            }
+
+            if (cmd.start < 0) {
+                if (@abs(cmd.start) >= list.len) {
+                    // trying to subtract past the length of the list
+                    // force to 0
+                    break :start 0;
+                }
+
+                break :start (list.len - @abs(cmd.start));
+            }
+
+            break :start @as(usize, @abs(cmd.start));
+        };
+
+        const i_stop: usize = stop: {
+            // if stop is >= length of array, don't index past the array length
+            if (cmd.stop >= list.len) {
+                break :stop list.len;
+            }
+
+            if (cmd.stop < 0) {
+                if (@abs(cmd.stop) >= list.len) {
+                    // trying to subtract past the length of the list
+                    // force to 0
+                    break :stop 0;
+                }
+
+                break :stop (list.len - @abs(cmd.stop));
+            }
+
+            break :stop @as(usize, @abs(cmd.stop));
+        };
+
+        // Create an allocated array for list items, to be encoded.
+        var to_encode: std.ArrayList([]const u8) = .empty;
+        defer to_encode.deinit(alloc);
+
+        var current = list.linked.first;
+        var i: usize = 0;
+        while (current) |node| {
+            if (i_start <= i and i <= i_stop) {
+                const item: *ListItem = @fieldParentPtr("node", node);
+                try to_encode.append(alloc, item.string.data.slice());
+            }
+
+            current = node.next;
+            i += 1;
+        }
+
+        return BulkArray.encode(out, to_encode.items);
+    }
+};
 //
 // const LLEN = struct {
 //     list: []const u8,
@@ -615,43 +676,43 @@ test "parse LPUSH, 1 element" {
     try std.testing.expectEqual(1, parsed.lpush.elements.items.len);
     try std.testing.expectEqualSlices(u8, "zig", parsed.lpush.elements.items[0]);
 }
-//
-// test "parse LRANGE" {
-//     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-//     defer arena.deinit();
-//
-//     const alloc = arena.allocator();
-//
-//     var buf: [100]u8 = undefined;
-//     var w: Writer = .fixed(&buf);
-//     BA(&w, &.{ "LRANGE", "test", "0", "1" });
-//
-//     const parsed = try parse(alloc, w.buffered());
-//
-//     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lrange);
-//     try std.testing.expectEqualSlices(u8, "test", parsed.lrange.list);
-//     try std.testing.expectEqual(0, parsed.lrange.start);
-//     try std.testing.expectEqual(1, parsed.lrange.stop);
-// }
-//
-// test "parse LRANGE negative" {
-//     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-//     defer arena.deinit();
-//
-//     const alloc = arena.allocator();
-//
-//     var buf: [100]u8 = undefined;
-//     var w: Writer = .fixed(&buf);
-//     BA(&w, &.{ "LRANGE", "test", "10", "-5" });
-//
-//     const parsed = try parse(alloc, w.buffered());
-//
-//     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lrange);
-//     try std.testing.expectEqualSlices(u8, "test", parsed.lrange.list);
-//     try std.testing.expectEqual(10, parsed.lrange.start);
-//     try std.testing.expectEqual(-5, parsed.lrange.stop);
-// }
-//
+
+test "parse LRANGE" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "LRANGE", "test", "0", "1" });
+
+    const parsed = try parse(alloc, w.buffered());
+
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lrange);
+    try std.testing.expectEqualSlices(u8, "test", parsed.lrange.list);
+    try std.testing.expectEqual(0, parsed.lrange.start);
+    try std.testing.expectEqual(1, parsed.lrange.stop);
+}
+
+test "parse LRANGE negative" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "LRANGE", "test", "10", "-5" });
+
+    const parsed = try parse(alloc, w.buffered());
+
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lrange);
+    try std.testing.expectEqualSlices(u8, "test", parsed.lrange.list);
+    try std.testing.expectEqual(10, parsed.lrange.start);
+    try std.testing.expectEqual(-5, parsed.lrange.stop);
+}
+
 // test "parse LLEN" {
 //     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
 //     defer arena.deinit();

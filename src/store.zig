@@ -9,7 +9,7 @@ const BufferPool = buffer_pool.BufferPool;
 /// As far as lookups go, this is all the hash map cares about storing.
 /// We call this "Value" so it aligns well with the attributes of
 /// structures returned by the hash map. (i.e. "value_ptr", etc)
-const Value = struct {
+pub const Value = struct {
     // Store a reference to the key, so it can be free'd when
     // this value is removed from the map.
     key: *const Buffer,
@@ -18,21 +18,21 @@ const Value = struct {
 
 /// This is the "logical" value our application cares about.
 /// Each key can refer to either a standalone "string" or a list of those.
-const InnerValue = union(enum) {
+pub const InnerValue = union(enum) {
     string: String,
     list: List,
 };
 
-const String = struct {
+pub const String = struct {
     data: *const Buffer,
 };
 
-const List = struct {
+pub const List = struct {
     linked: std.DoublyLinkedList,
     len: usize = 0,
 };
 
-const ListItem = struct {
+pub const ListItem = struct {
     node: std.DoublyLinkedList.Node,
     string: String,
 };
@@ -138,15 +138,8 @@ pub const Store = struct {
         store.map.putAssumeCapacity(key.slice(), .{ .key = key, .inner = inner });
     }
 
-    pub fn get(store: *Store, key: []const u8) ?[]const u8 {
-        const value: Value = store.map.get(key) orelse return null;
-        const inner = value.inner;
-
-        // TODO(nickmond) this asserts the value stored at key is a string
-        // we need to return an error if it's a list
-        // or... we handle all that at the command "protocol" level and just
-        // faithfully return values stored in this map
-        return inner.string.data.slice();
+    pub fn get(store: *Store, key: []const u8) ?Value {
+        return store.map.get(key);
     }
 
     pub fn push(store: *Store, direction: PushDirection, key_data: []const u8, element: []const u8) error{ OutOfMemory, InvalidDataType }!usize {
@@ -215,14 +208,14 @@ pub const Store = struct {
     }
 };
 
-test "basic usage" {
+test "basic set and get" {
     const alloc = std.testing.allocator;
 
     var store = try Store.init(alloc, 1);
     defer store.deinit(alloc);
 
     try store.set("zig", "test", .{});
-    const value = store.get("zig").?;
+    const value = store.get("zig").?.inner.string.data.slice();
 
     try std.testing.expectEqualSlices(u8, "test", value);
     try std.testing.expect(store.remove("zig"));
