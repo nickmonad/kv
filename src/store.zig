@@ -21,6 +21,14 @@ pub const Value = struct {
 pub const InnerValue = union(enum) {
     string: String,
     list: List,
+
+    pub fn is_string(v: InnerValue) bool {
+        return std.meta.activeTag(v) == .string;
+    }
+
+    pub fn is_list(v: InnerValue) bool {
+        return std.meta.activeTag(v) == .list;
+    }
 };
 
 pub const String = struct {
@@ -148,7 +156,7 @@ pub const Store = struct {
         const exists = store.map.getPtr(key_data);
         if (exists) |value| {
             // ensure key stores a list
-            if (std.meta.activeTag(value.inner) != .list) {
+            if (!value.inner.is_list()) {
                 return error.InvalidDataType;
             }
 

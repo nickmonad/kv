@@ -312,7 +312,7 @@ const LRANGE = struct {
         }
 
         const inner = value.?.inner;
-        if (std.meta.activeTag(inner) != .list) {
+        if (!inner.is_list()) {
             // TODO: return WRONGTYPE
             return out.print(NULL, .{});
         }
@@ -387,7 +387,7 @@ const LLEN = struct {
     fn do(cmd: LLEN, out: *Writer, kv: *Store) !void {
         const value = kv.get(cmd.list);
         if (value) |v| {
-            if (std.meta.activeTag(v.inner) != .list) {
+            if (!v.inner.is_list()) {
                 // TODO: return WRONGTYPE error
                 return out.print(NULL, .{});
             }
