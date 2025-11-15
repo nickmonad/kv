@@ -20,6 +20,43 @@ const ParseError = error{
     UnknownCommand,
 };
 
+const CommandName = enum {
+    ping,
+    echo,
+    set,
+    get,
+    rpush,
+    lpush,
+    lrange,
+    // llen,
+    // lpop,
+};
+
+const Command = union(CommandName) {
+    ping: PING,
+    echo: ECHO,
+    set: SET,
+    get: GET,
+    rpush: PUSH,
+    lpush: PUSH,
+    lrange: LRANGE,
+    // llen: LLEN,
+    // lpop: LPOP,
+
+    pub fn do(command: *Command, alloc: std.mem.Allocator, kv: *Store, out: *Writer) !void {
+        switch (command.*) {
+            .ping => |ping| return ping.do(out),
+            .echo => |echo| return echo.do(out),
+            .set => |set| return set.do(out, kv),
+            .get => |get| return get.do(out, kv),
+            .rpush, .lpush => |push| return push.do(out, kv),
+            .lrange => |lrange| return lrange.do(alloc, out, kv),
+            // .llen => |llen| return llen.do(out, kv),
+            // .lpop => |lpop| return lpop.do(alloc, out, kv),
+        }
+    }
+};
+
 // NOTE: Assume buffer holds a single command in RESP array format.
 // Pipelining is technically a thing, but I'm not sure what the format should be...
 // It seems like it should be the "inline command" format (not RESP): https://redis.io/docs/latest/develop/reference/protocol-spec/#inline-commands
@@ -138,43 +175,6 @@ const ParseIterator = struct {
         iter.index += 1;
 
         return iter.parsed.items[current];
-    }
-};
-
-const CommandName = enum {
-    ping,
-    echo,
-    set,
-    get,
-    rpush,
-    lpush,
-    lrange,
-    // llen,
-    // lpop,
-};
-
-const Command = union(CommandName) {
-    ping: PING,
-    echo: ECHO,
-    set: SET,
-    get: GET,
-    rpush: PUSH,
-    lpush: PUSH,
-    lrange: LRANGE,
-    // llen: LLEN,
-    // lpop: LPOP,
-
-    pub fn do(command: *Command, alloc: std.mem.Allocator, kv: *Store, out: *Writer) !void {
-        switch (command.*) {
-            .ping => |ping| return ping.do(out),
-            .echo => |echo| return echo.do(out),
-            .set => |set| return set.do(out, kv),
-            .get => |get| return get.do(out, kv),
-            .rpush, .lpush => |push| return push.do(out, kv),
-            .lrange => |lrange| return lrange.do(alloc, out, kv),
-            // .llen => |llen| return llen.do(out, kv),
-            // .lpop => |lpop| return lpop.do(alloc, out, kv),
-        }
     }
 };
 
