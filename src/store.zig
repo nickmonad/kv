@@ -193,6 +193,78 @@ pub const Store = struct {
         return list.len;
     }
 
+    // Caller owns allocated memory upon a successful return. If an error occurs during processing,
+    // this function will deinit the allocation, using the given allocator.
+    pub fn range(store: *Store, alloc: std.mem.Allocator, key: []const u8, start: isize, stop: isize) error{ OutOfMemory, InvalidDataType }!std.ArrayList([]const u8) {
+        var items: std.ArrayList([]const u8) = .empty;
+        errdefer items.deinit(alloc);
+
+        const value = store.get(key);
+        if (value == null) {
+            return items;
+        }
+
+        const inner = value.?.inner;
+        if (!inner.is_list()) {
+            return error.InvalidDataType;
+        }
+
+        const list = inner.list;
+
+        const i_start: usize = start: {
+            if (start >= list.len) {
+                return items;
+            }
+
+            if (start < 0) {
+                if (@abs(start) >= list.len) {
+                    // trying to subtract past the length of the list
+                    // force to 0
+                    break :start 0;
+                }
+
+                break :start (list.len - @abs(start));
+            }
+
+            break :start @as(usize, @abs(start));
+        };
+
+        const i_stop: usize = stop: {
+            // if stop is >= length of array, don't index past the array length
+            if (stop >= list.len) {
+                break :stop list.len;
+            }
+
+            if (stop < 0) {
+                if (@abs(stop) >= list.len) {
+                    // trying to subtract past the length of the list
+                    // force to 0
+                    break :stop 0;
+                }
+
+                break :stop (list.len - @abs(stop));
+            }
+
+            break :stop @as(usize, @abs(stop));
+        };
+
+        var current = list.linked.first;
+        var i: usize = 0;
+        while (current) |node| {
+            if (i_start <= i and i <= i_stop) {
+                const item: *ListItem = @fieldParentPtr("node", node);
+                const copied = try alloc.dupe(u8, item.string.data.slice());
+
+                try items.append(alloc, copied);
+            }
+
+            current = node.next;
+            i += 1;
+        }
+
+        return items;
+    }
+
     pub fn remove(store: *Store, key: []const u8) bool {
         const kv = store.map.fetchRemove(key) orelse return false;
         switch (kv.value.inner) {

@@ -306,73 +306,10 @@ const LRANGE = struct {
         out: *Writer,
         kv: *Store,
     ) !void {
-        const value = kv.get(cmd.list);
-        if (value == null) {
-            return BulkArray.encode(out, &.{});
-        }
+        var items = try kv.range(alloc, cmd.list, cmd.start, cmd.stop);
+        defer items.deinit(alloc);
 
-        const inner = value.?.inner;
-        if (!inner.is_list()) {
-            // TODO: return WRONGTYPE
-            return out.print(NULL, .{});
-        }
-
-        const list = inner.list;
-
-        const i_start: usize = start: {
-            if (cmd.start >= list.len) {
-                return BulkArray.encode(out, &.{});
-            }
-
-            if (cmd.start < 0) {
-                if (@abs(cmd.start) >= list.len) {
-                    // trying to subtract past the length of the list
-                    // force to 0
-                    break :start 0;
-                }
-
-                break :start (list.len - @abs(cmd.start));
-            }
-
-            break :start @as(usize, @abs(cmd.start));
-        };
-
-        const i_stop: usize = stop: {
-            // if stop is >= length of array, don't index past the array length
-            if (cmd.stop >= list.len) {
-                break :stop list.len;
-            }
-
-            if (cmd.stop < 0) {
-                if (@abs(cmd.stop) >= list.len) {
-                    // trying to subtract past the length of the list
-                    // force to 0
-                    break :stop 0;
-                }
-
-                break :stop (list.len - @abs(cmd.stop));
-            }
-
-            break :stop @as(usize, @abs(cmd.stop));
-        };
-
-        // Create an allocated array for list items, to be encoded.
-        var to_encode: std.ArrayList([]const u8) = .empty;
-        defer to_encode.deinit(alloc);
-
-        var current = list.linked.first;
-        var i: usize = 0;
-        while (current) |node| {
-            if (i_start <= i and i <= i_stop) {
-                const item: *ListItem = @fieldParentPtr("node", node);
-                try to_encode.append(alloc, item.string.data.slice());
-            }
-
-            current = node.next;
-            i += 1;
-        }
-
-        return BulkArray.encode(out, to_encode.items);
+        return BulkArray.encode(out, items.items);
     }
 };
 
