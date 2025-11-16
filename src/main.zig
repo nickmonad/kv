@@ -288,7 +288,7 @@ const Server = struct {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{ .enable_memory_limit = true }) = .init;
     defer assert(gpa.deinit() == .ok);
 
     // TODO(nickmonad)
