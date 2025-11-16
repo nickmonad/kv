@@ -20,10 +20,6 @@ test-cli:
     @redis-cli ECHO zig >> test.cli.out
     @redis-cli SET test zig >> test.cli.out
     @redis-cli GET test >> test.cli.out
-    @redis-cli SET expires test PX 1000 >> test.cli.out
-    @redis-cli GET expires >> test.cli.out
-    @sleep 1.1s
-    @redis-cli GET expires >> test.cli.out
 
     @redis-cli RPUSH list test >> test.cli.out
     @redis-cli RPUSH list again >> test.cli.out

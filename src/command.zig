@@ -29,7 +29,7 @@ const CommandName = enum {
     lpush,
     lrange,
     llen,
-    // lpop,
+    lpop,
 };
 
 const Command = union(CommandName) {
@@ -41,7 +41,7 @@ const Command = union(CommandName) {
     lpush: PUSH,
     lrange: LRANGE,
     llen: LLEN,
-    // lpop: LPOP,
+    lpop: LPOP,
 
     pub fn do(command: *Command, alloc: std.mem.Allocator, kv: *Store, out: *Writer) !void {
         switch (command.*) {
@@ -52,7 +52,7 @@ const Command = union(CommandName) {
             .rpush, .lpush => |push| return push.do(out, kv),
             .lrange => |lrange| return lrange.do(alloc, out, kv),
             .llen => |llen| return llen.do(out, kv),
-            // .lpop => |lpop| return lpop.do(alloc, out, kv),
+            .lpop => |lpop| return lpop.do(alloc, out, kv),
         }
     }
 };
@@ -90,7 +90,7 @@ pub fn parse(alloc: std.mem.Allocator, buf: []const u8) !Command {
         .lpush => return Command{ .lpush = try PUSH.parse(alloc, &iter, .left) },
         .lrange => return Command{ .lrange = try LRANGE.parse(&iter) },
         .llen => return Command{ .llen = try LLEN.parse(&iter) },
-        // .lpop => return Command{ .lpop = try LPOP.parse(&iter) },
+        .lpop => return Command{ .lpop = try LPOP.parse(&iter) },
     }
 }
 
@@ -309,7 +309,7 @@ const LRANGE = struct {
         var items = try kv.range(alloc, cmd.list, cmd.start, cmd.stop);
         defer items.deinit(alloc);
 
-        return BulkArray.encode(out, items.items);
+        return BulkArray.encode(out, items.list.items);
     }
 };
 
@@ -337,55 +337,45 @@ const LLEN = struct {
         return out.print(":0\r\n", .{});
     }
 };
-//
-// const LPOP = struct {
-//     key: []const u8,
-//     count: usize = 1,
-//
-//     fn parse(iter: *ParseIterator) !LPOP {
-//         const key = iter.next() orelse return ParseError.MissingData;
-//
-//         if (iter.next()) |count| {
-//             const c = try std.fmt.parseInt(usize, count, 10);
-//             return .{ .key = key, .count = c };
-//         }
-//
-//         return .{ .key = key };
-//     }
-//
-//     fn do(
-//         cmd: LPOP,
-//         alloc: std.mem.Allocator,
-//         out: *Writer,
-//         kv: *Store,
-//     ) !void {
-//         var list = try kv.lpop(alloc, cmd.key, cmd.count) orelse {
-//             return out.print(NULL, .{});
-//         };
-//
-//         defer list.deinit(alloc);
-//
-//         if (list.list.items.len == 0) {
-//             return BulkString.encode(out, "");
-//         }
-//
-//         if (list.list.items.len == 1) {
-//             // only 1 element, return as bulk string
-//             const element = list.list.items[0];
-//             return BulkString.encode(out, element.value);
-//         }
-//
-//         // multiple elements
-//         var to_encode: std.ArrayList([]const u8) = .empty;
-//         defer to_encode.deinit(alloc);
-//
-//         for (list.list.items) |item| {
-//             try to_encode.append(alloc, item.value);
-//         }
-//
-//         return BulkArray.encode(out, to_encode.items);
-//     }
-// };
+
+const LPOP = struct {
+    key: []const u8,
+    count: usize = 1,
+
+    fn parse(iter: *ParseIterator) !LPOP {
+        const key = iter.next() orelse return ParseError.MissingData;
+
+        if (iter.next()) |count| {
+            const c = try std.fmt.parseInt(usize, count, 10);
+            return .{ .key = key, .count = c };
+        }
+
+        return .{ .key = key };
+    }
+
+    fn do(
+        cmd: LPOP,
+        alloc: std.mem.Allocator,
+        out: *Writer,
+        kv: *Store,
+    ) !void {
+        var list = try kv.pop(alloc, cmd.key, cmd.count);
+        defer list.deinit(alloc);
+
+        if (list.list.items.len == 0) {
+            return BulkString.encode(out, "");
+        }
+
+        if (list.list.items.len == 1) {
+            // only 1 element, return as bulk string
+            const element = list.list.items[0];
+            return BulkString.encode(out, element);
+        }
+
+        // multiple elements
+        return BulkArray.encode(out, list.list.items);
+    }
+};
 
 // tests
 
@@ -676,20 +666,20 @@ test "parse LLEN" {
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.llen);
     try std.testing.expectEqualSlices(u8, "test", parsed.llen.list);
 }
-//
-// test "parse LPOP" {
-//     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-//     defer arena.deinit();
-//
-//     const alloc = arena.allocator();
-//
-//     var buf: [100]u8 = undefined;
-//     var w: Writer = .fixed(&buf);
-//     BA(&w, &.{ "LPOP", "test", "10" });
-//
-//     const parsed = try parse(alloc, w.buffered());
-//
-//     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lpop);
-//     try std.testing.expectEqualSlices(u8, "test", parsed.lpop.key);
-//     try std.testing.expectEqual(10, parsed.lpop.count);
-// }
+
+test "parse LPOP" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const alloc = arena.allocator();
+
+    var buf: [100]u8 = undefined;
+    var w: Writer = .fixed(&buf);
+    BA(&w, &.{ "LPOP", "test", "10" });
+
+    const parsed = try parse(alloc, w.buffered());
+
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lpop);
+    try std.testing.expectEqualSlices(u8, "test", parsed.lpop.key);
+    try std.testing.expectEqual(10, parsed.lpop.count);
+}

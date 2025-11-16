@@ -49,6 +49,22 @@ pub const SetOptions = struct {
     expires_in: ?i64 = null, // milliseconds, type defined by std.time
 };
 
+pub const AllocatedList = struct {
+    list: std.ArrayList([]const u8),
+
+    fn init() AllocatedList {
+        return .{ .list = .empty };
+    }
+
+    pub fn deinit(list: *AllocatedList, alloc: std.mem.Allocator) void {
+        for (list.list.items) |item| {
+            alloc.free(item);
+        }
+
+        list.list.deinit(alloc);
+    }
+};
+
 pub const Store = struct {
     pub const PushDirection = enum { left, right };
 
@@ -195,8 +211,8 @@ pub const Store = struct {
 
     // Caller owns allocated memory upon a successful return. If an error occurs during processing,
     // this function will deinit the allocation, using the given allocator.
-    pub fn range(store: *Store, alloc: std.mem.Allocator, key: []const u8, start: isize, stop: isize) error{ OutOfMemory, InvalidDataType }!std.ArrayList([]const u8) {
-        var items: std.ArrayList([]const u8) = .empty;
+    pub fn range(store: *Store, alloc: std.mem.Allocator, key: []const u8, start: isize, stop: isize) error{ OutOfMemory, InvalidDataType }!AllocatedList {
+        var items = AllocatedList.init();
         errdefer items.deinit(alloc);
 
         const value = store.get(key);
@@ -255,11 +271,41 @@ pub const Store = struct {
                 const item: *ListItem = @fieldParentPtr("node", node);
                 const copied = try alloc.dupe(u8, item.string.data.slice());
 
-                try items.append(alloc, copied);
+                try items.list.append(alloc, copied);
             }
 
             current = node.next;
             i += 1;
+        }
+
+        return items;
+    }
+
+    pub fn pop(store: *Store, alloc: std.mem.Allocator, key: []const u8, count: usize) error{ OutOfMemory, InvalidDataType }!AllocatedList {
+        var items = AllocatedList.init();
+        errdefer items.deinit(alloc);
+
+        const exists = store.map.getPtr(key);
+        if (exists) |value| {
+            if (!value.inner.is_list()) {
+                return error.InvalidDataType;
+            }
+
+            for (0..count) |_| {
+                if (value.inner.list.linked.popFirst()) |node| {
+                    const item: *ListItem = @fieldParentPtr("node", node);
+
+                    // copy value and append to return list
+                    const copied = try alloc.dupe(u8, item.string.data.slice());
+                    try items.list.append(alloc, copied);
+
+                    // deallocate item out from stored list
+                    store.values.release(@constCast(item.string.data));
+                    store.list_items.destroy(item);
+
+                    value.inner.list.len -= 1;
+                }
+            }
         }
 
         return items;
@@ -328,4 +374,29 @@ test "push, multiple elements" {
     try std.testing.expectEqual(7, try store.push(.left, "list", "g"));
     try std.testing.expectEqual(8, try store.push(.left, "list", "h"));
     try std.testing.expectEqual(9, try store.push(.left, "list", "i"));
+}
+
+test "pop" {
+    const alloc = std.testing.allocator;
+
+    var store = try Store.init(alloc, 10);
+    defer store.deinit(alloc);
+
+    _ = try store.push(.right, "list", "a");
+    _ = try store.push(.right, "list", "b");
+    _ = try store.push(.right, "list", "c");
+
+    var items = try store.pop(alloc, "list", 1);
+    defer items.deinit(alloc);
+
+    try std.testing.expectEqual(1, items.list.items.len);
+
+    const value = store.get("list").?;
+    try std.testing.expectEqual(2, value.inner.list.len);
+
+    const first: *ListItem = @fieldParentPtr("node", value.inner.list.linked.first.?);
+    try std.testing.expectEqualSlices(u8, "b", first.string.data.slice());
+
+    const second: *ListItem = @fieldParentPtr("node", value.inner.list.linked.first.?.next.?);
+    try std.testing.expectEqualSlices(u8, "c", second.string.data.slice());
 }
