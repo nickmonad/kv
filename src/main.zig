@@ -50,6 +50,9 @@ const Completion = struct {
             .send => |send| {
                 sqe.prep_send(send.socket, send.buffer[0..send.length], 0);
             },
+            .close => |close| {
+                sqe.prep_close(close.socket);
+            },
         }
 
         sqe.user_data = @intFromPtr(completion);
@@ -70,6 +73,9 @@ const Operation = union(enum) {
         socket: posix.socket_t,
         buffer: []u8,
         length: usize,
+    },
+    close: struct {
+        socket: posix.socket_t,
     },
 };
 
@@ -106,9 +112,6 @@ const ConnectionPool = struct {
     }
 
     fn destroy(pool: *ConnectionPool, connection: *Connection) void {
-        // TODO(nickmonad) this should be a SQE to prevent blocking thread on syscall (handled in Server)
-        _ = linux.close(connection.client);
-
         pool.buffers.release(connection.recv_buffer);
         pool.buffers.release(connection.send_buffer);
 
@@ -190,6 +193,10 @@ const Server = struct {
                             const connection: *Connection = @fieldParentPtr("completion", completion);
                             server.on_send(connection);
                         },
+                        .close => {
+                            const connection: *Connection = @fieldParentPtr("completion", completion);
+                            server.on_close(connection);
+                        },
                     }
                 }
             }
@@ -232,7 +239,18 @@ const Server = struct {
 
         if (read == 0) {
             // connection closed by client, cleanup
-            server.close(connection);
+            connection.completion = .{
+                .operation = .{
+                    .close = .{
+                        .socket = connection.client,
+                    },
+                },
+            };
+
+            // TODO enqueue these if no more SQEs are available
+            const close = server.ring.get_sqe() catch unreachable;
+            connection.completion.prepare(close);
+
             return;
         }
 
@@ -248,11 +266,13 @@ const Server = struct {
         var cmd = command.parse(alloc, connection.recv_buffer.buf[0..read]) catch unreachable;
         cmd.do(alloc, server.kv, &output) catch unreachable;
 
-        connection.completion.operation = .{
-            .send = .{
-                .socket = connection.client,
-                .buffer = connection.send_buffer.buf,
-                .length = output.buffered().len,
+        connection.completion = .{
+            .operation = .{
+                .send = .{
+                    .socket = connection.client,
+                    .buffer = connection.send_buffer.buf,
+                    .length = output.buffered().len,
+                },
             },
         };
 
@@ -281,7 +301,7 @@ const Server = struct {
         connection.completion.prepare(recv);
     }
 
-    fn close(server: *Server, connection: *Connection) void {
+    fn on_close(server: *Server, connection: *Connection) void {
         assert(connection.valid());
         server.connections.destroy(connection);
     }
