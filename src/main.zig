@@ -11,9 +11,9 @@ const io_uring_sqe = linux.io_uring_sqe;
 const io_uring_cqe = linux.io_uring_cqe;
 const Writer = std.io.Writer;
 
-const buffer_pool = @import("buffer_pool.zig");
-const Buffer = buffer_pool.Buffer;
-const BufferPool = buffer_pool.BufferPool;
+const byte_array = @import("byte_array.zig");
+const ByteArray = byte_array.ByteArray;
+const ByteArrayPool = byte_array.ByteArrayPool;
 
 const command = @import("command.zig");
 const store = @import("store.zig");
@@ -23,14 +23,13 @@ const PORT = 6379;
 const IO_URING_ENTIRES = 1024;
 
 const Connection = struct {
+    completion: Completion = undefined,
     client: posix.socket_t = undefined,
 
-    recv_buffer: *Buffer,
-    send_buffer: *Buffer,
+    recv_buffer: *ByteArray,
+    send_buffer: *ByteArray,
 
-    completion: Completion = undefined,
-
-    fn valid(c: Connection) bool {
+    fn valid(c: *Connection) bool {
         return c.recv_buffer.reserved and c.send_buffer.reserved;
     }
 };
@@ -82,12 +81,12 @@ const Operation = union(enum) {
 const ConnectionPool = struct {
     const Pool = std.heap.MemoryPoolExtra(Connection, .{ .growable = false });
 
-    buffers: BufferPool,
+    buffers: ByteArrayPool,
     connections: Pool,
 
     fn init(gpa: std.mem.Allocator, max_connections: u32) !ConnectionPool {
         const pool = try Pool.initPreheated(gpa, max_connections);
-        const buffers = try BufferPool.init(gpa, max_connections * 2, 4096);
+        const buffers = try ByteArrayPool.init(gpa, max_connections * 2, 4096);
 
         return .{
             .buffers = buffers,
@@ -220,7 +219,7 @@ const Server = struct {
             .operation = .{
                 .recv = .{
                     .socket = client,
-                    .buffer = connection.recv_buffer.buf,
+                    .buffer = connection.recv_buffer.data,
                 },
             },
         };
@@ -257,20 +256,20 @@ const Server = struct {
         // wrap send_buffer in allocator
         // command will "write" to this allocator
         // TODO(nickmonad) handle command failure (OOM or otherwise?)
-        var output: Writer = .fixed(connection.send_buffer.buf);
+        var output: Writer = .fixed(connection.send_buffer.data);
 
         const alloc = server.fba.allocator();
         defer server.fba.reset();
 
         // TODO(nickmonad) handle parsing error
-        var cmd = command.parse(alloc, connection.recv_buffer.buf[0..read]) catch unreachable;
+        var cmd = command.parse(alloc, connection.recv_buffer.data[0..read]) catch unreachable;
         cmd.do(alloc, server.kv, &output) catch unreachable;
 
         connection.completion = .{
             .operation = .{
                 .send = .{
                     .socket = connection.client,
-                    .buffer = connection.send_buffer.buf,
+                    .buffer = connection.send_buffer.data,
                     .length = output.buffered().len,
                 },
             },
@@ -291,7 +290,7 @@ const Server = struct {
         connection.completion.operation = .{
             .recv = .{
                 .socket = connection.client,
-                .buffer = connection.recv_buffer.buf,
+                .buffer = connection.recv_buffer.data,
             },
         };
 

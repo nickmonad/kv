@@ -1,9 +1,9 @@
 const std = @import("std");
 const assert = std.debug.assert;
 
-const buffer_pool = @import("./buffer_pool.zig");
-const Buffer = buffer_pool.Buffer;
-const BufferPool = buffer_pool.BufferPool;
+const byte_array = @import("./byte_array.zig");
+const ByteArray = byte_array.ByteArray;
+const ByteArrayPool = byte_array.ByteArrayPool;
 
 /// Direct value type referenced by the internal hash map.
 /// As far as lookups go, this is all the hash map cares about storing.
@@ -12,7 +12,7 @@ const BufferPool = buffer_pool.BufferPool;
 pub const Value = struct {
     // Store a reference to the key, so it can be free'd when
     // this value is removed from the map.
-    key: *const Buffer,
+    key: *const ByteArray,
     inner: InnerValue,
 };
 
@@ -32,7 +32,7 @@ pub const InnerValue = union(enum) {
 };
 
 pub const String = struct {
-    data: *const Buffer,
+    data: *const ByteArray,
 };
 
 pub const List = struct {
@@ -72,8 +72,8 @@ pub const Store = struct {
 
     map: std.StringHashMapUnmanaged(Value),
 
-    keys: BufferPool,
-    values: BufferPool,
+    keys: ByteArrayPool,
+    values: ByteArrayPool,
 
     list_items: ListItemPool,
 
@@ -83,7 +83,7 @@ pub const Store = struct {
     /// This is to ensure that the number of _associations_ of key to value can be closer
     /// to what is configured here as `size`, in the event a handful of keys allocate many
     /// values as part of a list.
-    pub fn init(gpa: std.mem.Allocator, size: u32) error{OutOfMemory}!Store {
+    pub fn init(gpa: std.mem.Allocator, size: u32) !Store {
         const num_keys = size;
         const num_vals = num_keys * 2;
 
@@ -91,8 +91,8 @@ pub const Store = struct {
         try map.ensureTotalCapacity(gpa, num_keys);
 
         // TODO(nickmonad) config
-        const keys = try BufferPool.init(gpa, num_keys, 1024);
-        const values = try BufferPool.init(gpa, num_vals, 1024);
+        const keys = try ByteArrayPool.init(gpa, num_keys, 1024);
+        const values = try ByteArrayPool.init(gpa, num_vals, 1024);
 
         // Create a pool of list items for list values.
         // In practice, we may get really poor utilization of this allocated space,
@@ -139,7 +139,7 @@ pub const Store = struct {
         }
     }
 
-    pub fn set(store: *Store, key_data: []const u8, val_data: []const u8, _: SetOptions) error{OutOfMemory}!void {
+    pub fn set(store: *Store, key_data: []const u8, val_data: []const u8, _: SetOptions) error{ OutOfMemory, DataOverflow }!void {
         try store.has_availability();
 
         // TODO(nickmonad)
@@ -166,7 +166,11 @@ pub const Store = struct {
         return store.map.get(key);
     }
 
-    pub fn push(store: *Store, direction: PushDirection, key_data: []const u8, element: []const u8) error{ OutOfMemory, InvalidDataType }!usize {
+    pub fn push(store: *Store, direction: PushDirection, key_data: []const u8, element: []const u8) error{
+        OutOfMemory,
+        InvalidDataType,
+        DataOverflow,
+    }!usize {
         try store.has_availability();
 
         const exists = store.map.getPtr(key_data);

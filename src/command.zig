@@ -179,8 +179,8 @@ const ParseIterator = struct {
 };
 
 const PING = struct {
-    fn do(_: PING, w: *Writer) !void {
-        return w.print(PONG, .{});
+    fn do(_: PING, out: *Writer) !void {
+        return out.print(PONG, .{});
     }
 };
 
