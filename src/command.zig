@@ -12,6 +12,7 @@ const BulkString = encoding.BulkString;
 const OK = "+OK\r\n";
 const NULL = "$-1\r\n";
 const PONG = "+PONG\r\n";
+const ERROR_WRONGTYPE = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
 
 const ParseError = error{
     InvalidArrayFormat,
@@ -241,8 +242,7 @@ const GET = struct {
 
         switch (inner) {
             .string => |s| return BulkString.encode(out, s.data.slice()),
-            // TODO return WRONGTYPE
-            else => return out.print(NULL, .{}),
+            else => return out.print(ERROR_WRONGTYPE, .{}),
         }
     }
 };
@@ -325,8 +325,7 @@ const LLEN = struct {
         const value = kv.get(cmd.list);
         if (value) |v| {
             if (!v.inner.is_list()) {
-                // TODO: return WRONGTYPE error
-                return out.print(NULL, .{});
+                return out.print(ERROR_WRONGTYPE, .{});
             }
 
             const list = v.inner.list;
