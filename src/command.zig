@@ -1,5 +1,8 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Writer = std.io.Writer;
+
+const Config = @import("config.zig").Config;
 
 const Store = @import("store.zig").Store;
 const ListItem = @import("store.zig").ListItem;
@@ -22,76 +25,125 @@ const ParseError = error{
 };
 
 const CommandName = enum {
-    ping,
-    echo,
-    set,
-    get,
-    rpush,
-    lpush,
-    lrange,
-    llen,
-    lpop,
+    PING,
+    ECHO,
+    SET,
+    GET,
+    RPUSH,
+    LPUSH,
+    LRANGE,
+    LLEN,
+    LPOP,
 };
 
 const Command = union(CommandName) {
-    ping: PING,
-    echo: ECHO,
-    set: SET,
-    get: GET,
-    rpush: PUSH,
-    lpush: PUSH,
-    lrange: LRANGE,
-    llen: LLEN,
-    lpop: LPOP,
+    PING: PING,
+    ECHO: ECHO,
+    SET: SET,
+    GET: GET,
+    RPUSH: PUSH,
+    LPUSH: PUSH,
+    LRANGE: LRANGE,
+    LLEN: LLEN,
+    LPOP: LPOP,
 
-    pub fn do(command: *Command, alloc: std.mem.Allocator, kv: *Store, out: *Writer) !void {
-        switch (command.*) {
-            .ping => |ping| return ping.do(out),
-            .echo => |echo| return echo.do(out),
-            .set => |set| return set.do(out, kv),
-            .get => |get| return get.do(out, kv),
-            .rpush, .lpush => |push| return push.do(out, kv),
-            .lrange => |lrange| return lrange.do(alloc, out, kv),
-            .llen => |llen| return llen.do(out, kv),
-            .lpop => |lpop| return lpop.do(alloc, out, kv),
+    pub fn do(
+        command: Command,
+        alloc: std.mem.Allocator,
+        copy_capacity: usize,
+        kv: *Store,
+        out: *Writer,
+    ) !void {
+        switch (command) {
+            .PING => |ping| return ping.do(out),
+            .ECHO => |echo| return echo.do(out),
+            .SET => |set| return set.do(out, kv),
+            .GET => |get| return get.do(out, kv),
+            .RPUSH, .LPUSH => |push| return push.do(out, kv),
+            .LRANGE => |lrange| return lrange.do(alloc, copy_capacity, out, kv),
+            .LLEN => |llen| return llen.do(out, kv),
+            .LPOP => |lpop| return lpop.do(alloc, copy_capacity, out, kv),
         }
+    }
+};
+
+pub const Runner = struct {
+    fba: std.heap.FixedBufferAllocator,
+    kv: *Store,
+
+    parse_cap: usize,
+    copy_cap: usize,
+
+    pub fn init(gpa: std.mem.Allocator, config: Config, kv: *Store) !Runner {
+        const L = config.list_length_max;
+        const V = config.val_size_max;
+
+        // ArrayList([]const u8) of largest possible command
+        const parse_cap = (1 + 1 + L);
+        const parse_size: u64 = (parse_cap * @sizeOf([]const u8));
+
+        // ArrayList([]const u8) pointing to duplicated values
+        const copy_cap = L;
+        const copy_size = (L * @sizeOf([]const u8));
+        const duplicated_size = (L * V);
+
+        const fba_size: u64 = parse_size + copy_size + duplicated_size;
+        const buffer = try gpa.alloc(u8, fba_size);
+        const fba = std.heap.FixedBufferAllocator.init(buffer);
+
+        return .{
+            .fba = fba,
+            .kv = kv,
+            .parse_cap = parse_cap,
+            .copy_cap = copy_cap,
+        };
+    }
+
+    pub fn deinit(runner: *Runner, gpa: std.mem.Allocator) void {
+        gpa.free(runner.fba.buffer);
+    }
+
+    pub fn run(runner: *Runner, request: []const u8, out: *Writer) !void {
+        assert(runner.fba.end_index == 0);
+        defer runner.fba.reset();
+
+        const alloc = runner.fba.allocator();
+
+        // TODO(nickmonad) handle parsing and exec errors
+        var command = try parse(alloc, runner.parse_cap, request);
+        try command.do(alloc, runner.copy_cap, runner.kv, out);
     }
 };
 
 // NOTE: Assume buffer holds a single command in RESP array format.
 // Pipelining is technically a thing, but I'm not sure what the format should be...
 // It seems like it should be the "inline command" format (not RESP): https://redis.io/docs/latest/develop/reference/protocol-spec/#inline-commands
-pub fn parse(alloc: std.mem.Allocator, buf: []const u8) !Command {
-    var iter = try ParseIterator.init(alloc, buf);
-    defer iter.deinit(alloc);
+pub fn parse(alloc: std.mem.Allocator, capacity: usize, buf: []const u8) !Command {
+    var iter = try ParseIterator.init(alloc, capacity, buf);
 
     // command (first element)
-    const cmd_parsed = p: {
-        if (iter.next()) |parsed| {
-            break :p parsed;
+    const cmd_parsed = c: {
+        if (iter.next()) |cmd| {
+            break :c cmd;
         }
 
         return ParseError.UnknownCommand;
     };
 
-    // normalize to lower case to check against enum
-    const lower = try std.ascii.allocLowerString(alloc, cmd_parsed);
-    defer alloc.free(lower);
-
-    const cmd = std.meta.stringToEnum(CommandName, lower) orelse {
+    const cmd = std.meta.stringToEnum(CommandName, cmd_parsed) orelse {
         return ParseError.UnknownCommand;
     };
 
     switch (cmd) {
-        .ping => return Command{ .ping = PING{} },
-        .echo => return Command{ .echo = try ECHO.parse(&iter) },
-        .set => return Command{ .set = try SET.parse(&iter) },
-        .get => return Command{ .get = try GET.parse(&iter) },
-        .rpush => return Command{ .rpush = try PUSH.parse(alloc, &iter, .right) },
-        .lpush => return Command{ .lpush = try PUSH.parse(alloc, &iter, .left) },
-        .lrange => return Command{ .lrange = try LRANGE.parse(&iter) },
-        .llen => return Command{ .llen = try LLEN.parse(&iter) },
-        .lpop => return Command{ .lpop = try LPOP.parse(&iter) },
+        .PING => return Command{ .PING = PING{} },
+        .ECHO => return Command{ .ECHO = try ECHO.parse(&iter) },
+        .SET => return Command{ .SET = try SET.parse(&iter) },
+        .GET => return Command{ .GET = try GET.parse(&iter) },
+        .RPUSH => return Command{ .RPUSH = try PUSH.parse(&iter, .right) },
+        .LPUSH => return Command{ .LPUSH = try PUSH.parse(&iter, .left) },
+        .LRANGE => return Command{ .LRANGE = try LRANGE.parse(&iter) },
+        .LLEN => return Command{ .LLEN = try LLEN.parse(&iter) },
+        .LPOP => return Command{ .LPOP = try LPOP.parse(&iter) },
     }
 }
 
@@ -99,15 +151,12 @@ const ParseIterator = struct {
     parsed: std.ArrayList([]const u8),
     index: usize = 0,
 
-    fn init(alloc: std.mem.Allocator, buf: []const u8) !ParseIterator {
+    fn init(alloc: std.mem.Allocator, capacity: usize, buf: []const u8) !ParseIterator {
+        var parsed: std.ArrayList([]const u8) = try .initCapacity(alloc, capacity);
+        errdefer parsed.deinit(alloc);
+
         // iterator over raw bulk array buffer
         var iter = std.mem.splitSequence(u8, buf, "\r\n");
-
-        // "parsed" items
-        // gather up every bulk string within the array, validating the $<length> component
-        // (but not storing them)
-        var parsed: std.ArrayList([]const u8) = .empty;
-        errdefer parsed.deinit(alloc);
 
         // parse size (n) of bulk string array
         const n_slice = iter.first();
@@ -153,14 +202,17 @@ const ParseIterator = struct {
             }
 
             // all good
-            try parsed.append(alloc, data);
+            try parsed.appendBounded(data);
         }
 
         if (parsed.items.len != n) {
             return ParseError.InvalidArrayFormat;
         }
 
-        return .{ .parsed = parsed };
+        return .{
+            .parsed = parsed,
+            .index = 0,
+        };
     }
 
     fn deinit(iter: *ParseIterator, alloc: std.mem.Allocator) void {
@@ -176,6 +228,13 @@ const ParseIterator = struct {
         iter.index += 1;
 
         return iter.parsed.items[current];
+    }
+
+    fn rest(iter: *ParseIterator) []const []const u8 {
+        const start = iter.index;
+        const end = iter.parsed.items.len;
+
+        return iter.parsed.items[start..end];
     }
 };
 
@@ -249,30 +308,29 @@ const GET = struct {
 
 const PUSH = struct {
     list: []const u8,
-    elements: std.ArrayList([]const u8),
+    elements: []const []const u8,
     direction: PushDirection,
 
     fn parse(
-        alloc: std.mem.Allocator,
         iter: *ParseIterator,
         direction: PushDirection,
     ) !PUSH {
         const list = iter.next() orelse return ParseError.MissingData;
-        var elements: std.ArrayList([]const u8) = .empty;
+        const elements = iter.rest();
 
-        while (iter.next()) |element| {
-            try elements.append(alloc, element);
-        }
-
-        return .{ .list = list, .elements = elements, .direction = direction };
+        return .{
+            .list = list,
+            .elements = elements,
+            .direction = direction,
+        };
     }
 
     fn do(cmd: PUSH, out: *Writer, kv: *Store) !void {
         const length = length: {
             var len: usize = undefined;
-            for (cmd.elements.items) |element| {
-                // TODO: probably gonna be more efficient to add an kv method
-                // for rpushing multiple elements, so we'd don't have to lookup the key every time
+            for (cmd.elements) |element| {
+                // TODO(nickmonad): batched kv.push
+                // will avoid having to lookup the key on every iteration
                 len = try kv.push(cmd.direction, cmd.list, element);
             }
 
@@ -303,13 +361,15 @@ const LRANGE = struct {
     fn do(
         cmd: LRANGE,
         alloc: std.mem.Allocator,
+        copy_capacity: usize,
         out: *Writer,
         kv: *Store,
     ) !void {
-        var items = try kv.range(alloc, cmd.list, cmd.start, cmd.stop);
-        defer items.deinit(alloc);
+        var copied: std.ArrayList([]const u8) = try .initCapacity(alloc, copy_capacity);
+        defer copied.deinit(alloc);
 
-        return BulkArray.encode(out, items.list.items);
+        try kv.range(alloc, &copied, cmd.list, cmd.start, cmd.stop);
+        return BulkArray.encode(out, copied.items);
     }
 };
 
@@ -355,24 +415,27 @@ const LPOP = struct {
     fn do(
         cmd: LPOP,
         alloc: std.mem.Allocator,
+        copy_capacity: usize,
         out: *Writer,
         kv: *Store,
     ) !void {
-        var list = try kv.pop(alloc, cmd.key, cmd.count);
-        defer list.deinit(alloc);
+        var copied: std.ArrayList([]const u8) = try .initCapacity(alloc, copy_capacity);
+        defer copied.deinit(alloc);
 
-        if (list.list.items.len == 0) {
+        try kv.pop(alloc, &copied, cmd.key, cmd.count);
+
+        if (copied.items.len == 0) {
             return BulkString.encode(out, "");
         }
 
-        if (list.list.items.len == 1) {
+        if (copied.items.len == 1) {
             // only 1 element, return as bulk string
-            const element = list.list.items[0];
+            const element = copied.items[0];
             return BulkString.encode(out, element);
         }
 
         // multiple elements
-        return BulkArray.encode(out, list.list.items);
+        return BulkArray.encode(out, copied.items);
     }
 };
 
@@ -467,7 +530,7 @@ test "parse PING" {
 
     const alloc = arena.allocator();
     const parsed = try parse(alloc, w.buffered());
-    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.ping);
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.PING);
 }
 
 test "parse ECHO error missing" {
@@ -491,8 +554,8 @@ test "parse ECHO arg" {
     BA(&w, &.{ "ECHO", "hello, zig" });
 
     const parsed = try parse(alloc, w.buffered());
-    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.echo);
-    try std.testing.expectEqualSlices(u8, "hello, zig", parsed.echo.arg);
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.ECHO);
+    try std.testing.expectEqualSlices(u8, "hello, zig", parsed.ECHO.arg);
 }
 
 test "parse SET error missing" {
@@ -517,9 +580,9 @@ test "parse SET key value" {
 
     const parsed = try parse(alloc, w.buffered());
 
-    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.set);
-    try std.testing.expectEqualSlices(u8, "test", parsed.set.key);
-    try std.testing.expectEqualSlices(u8, "zig", parsed.set.value);
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.SET);
+    try std.testing.expectEqualSlices(u8, "test", parsed.SET.key);
+    try std.testing.expectEqualSlices(u8, "zig", parsed.SET.value);
 }
 
 test "parse SET key value PX expiry" {
@@ -534,10 +597,10 @@ test "parse SET key value PX expiry" {
 
     const parsed = try parse(alloc, w.buffered());
 
-    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.set);
-    try std.testing.expectEqualSlices(u8, "test", parsed.set.key);
-    try std.testing.expectEqualSlices(u8, "zig", parsed.set.value);
-    try std.testing.expectEqual(100, parsed.set.expires_in.?);
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.SET);
+    try std.testing.expectEqualSlices(u8, "test", parsed.SET.key);
+    try std.testing.expectEqualSlices(u8, "zig", parsed.SET.value);
+    try std.testing.expectEqual(100, parsed.SET.expires_in.?);
 }
 
 test "parse GET" {
@@ -552,8 +615,8 @@ test "parse GET" {
 
     const parsed = try parse(alloc, w.buffered());
 
-    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.get);
-    try std.testing.expectEqualSlices(u8, "test", parsed.get.key);
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.GET);
+    try std.testing.expectEqualSlices(u8, "test", parsed.GET.key);
 }
 
 test "parse RPUSH, 1 element" {
@@ -568,11 +631,11 @@ test "parse RPUSH, 1 element" {
 
     const parsed = try parse(alloc, w.buffered());
 
-    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.rpush);
-    try std.testing.expectEqualSlices(u8, "test", parsed.rpush.list);
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.RPUSH);
+    try std.testing.expectEqualSlices(u8, "test", parsed.RPUSH.list);
 
-    try std.testing.expectEqual(1, parsed.rpush.elements.items.len);
-    try std.testing.expectEqualSlices(u8, "zig", parsed.rpush.elements.items[0]);
+    try std.testing.expectEqual(1, parsed.RPUSH.elements.items.len);
+    try std.testing.expectEqualSlices(u8, "zig", parsed.RPUSH.elements.items[0]);
 }
 
 test "parse RPUSH, mulitple elements" {
@@ -587,12 +650,12 @@ test "parse RPUSH, mulitple elements" {
 
     const parsed = try parse(alloc, w.buffered());
 
-    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.rpush);
-    try std.testing.expectEqualSlices(u8, "test", parsed.rpush.list);
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.RPUSH);
+    try std.testing.expectEqualSlices(u8, "test", parsed.RPUSH.list);
 
-    try std.testing.expectEqual(2, parsed.rpush.elements.items.len);
-    try std.testing.expectEqualSlices(u8, "zig", parsed.rpush.elements.items[0]);
-    try std.testing.expectEqualSlices(u8, "cool", parsed.rpush.elements.items[1]);
+    try std.testing.expectEqual(2, parsed.RPUSH.elements.items.len);
+    try std.testing.expectEqualSlices(u8, "zig", parsed.RPUSH.elements.items[0]);
+    try std.testing.expectEqualSlices(u8, "cool", parsed.RPUSH.elements.items[1]);
 }
 
 test "parse LPUSH, 1 element" {
@@ -607,11 +670,11 @@ test "parse LPUSH, 1 element" {
 
     const parsed = try parse(alloc, w.buffered());
 
-    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lpush);
-    try std.testing.expectEqualSlices(u8, "test", parsed.lpush.list);
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LPUSH);
+    try std.testing.expectEqualSlices(u8, "test", parsed.LPUSH.list);
 
-    try std.testing.expectEqual(1, parsed.lpush.elements.items.len);
-    try std.testing.expectEqualSlices(u8, "zig", parsed.lpush.elements.items[0]);
+    try std.testing.expectEqual(1, parsed.LPUSH.elements.items.len);
+    try std.testing.expectEqualSlices(u8, "zig", parsed.LPUSH.elements.items[0]);
 }
 
 test "parse LRANGE" {
@@ -626,10 +689,10 @@ test "parse LRANGE" {
 
     const parsed = try parse(alloc, w.buffered());
 
-    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lrange);
-    try std.testing.expectEqualSlices(u8, "test", parsed.lrange.list);
-    try std.testing.expectEqual(0, parsed.lrange.start);
-    try std.testing.expectEqual(1, parsed.lrange.stop);
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LRANGE);
+    try std.testing.expectEqualSlices(u8, "test", parsed.LRANGE.list);
+    try std.testing.expectEqual(0, parsed.LRANGE.start);
+    try std.testing.expectEqual(1, parsed.LRANGE.stop);
 }
 
 test "parse LRANGE negative" {
@@ -644,10 +707,10 @@ test "parse LRANGE negative" {
 
     const parsed = try parse(alloc, w.buffered());
 
-    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lrange);
-    try std.testing.expectEqualSlices(u8, "test", parsed.lrange.list);
-    try std.testing.expectEqual(10, parsed.lrange.start);
-    try std.testing.expectEqual(-5, parsed.lrange.stop);
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LRANGE);
+    try std.testing.expectEqualSlices(u8, "test", parsed.LRANGE.list);
+    try std.testing.expectEqual(10, parsed.LRANGE.start);
+    try std.testing.expectEqual(-5, parsed.LRANGE.stop);
 }
 
 test "parse LLEN" {
@@ -662,8 +725,8 @@ test "parse LLEN" {
 
     const parsed = try parse(alloc, w.buffered());
 
-    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.llen);
-    try std.testing.expectEqualSlices(u8, "test", parsed.llen.list);
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LLEN);
+    try std.testing.expectEqualSlices(u8, "test", parsed.LLEN.list);
 }
 
 test "parse LPOP" {
@@ -678,7 +741,7 @@ test "parse LPOP" {
 
     const parsed = try parse(alloc, w.buffered());
 
-    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.lpop);
-    try std.testing.expectEqualSlices(u8, "test", parsed.lpop.key);
-    try std.testing.expectEqual(10, parsed.lpop.count);
+    try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LPOP);
+    try std.testing.expectEqualSlices(u8, "test", parsed.LPOP.key);
+    try std.testing.expectEqual(10, parsed.LPOP.count);
 }

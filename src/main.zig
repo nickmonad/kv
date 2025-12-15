@@ -11,6 +11,9 @@ const io_uring_sqe = linux.io_uring_sqe;
 const io_uring_cqe = linux.io_uring_cqe;
 const Writer = std.io.Writer;
 
+const Config = @import("config.zig").Config;
+const Allocation = @import("config.zig").Allocation;
+
 const byte_array = @import("byte_array.zig");
 const ByteArray = byte_array.ByteArray;
 const ByteArrayPool = byte_array.ByteArrayPool;
@@ -81,28 +84,39 @@ const Operation = union(enum) {
 const ConnectionPool = struct {
     const Pool = std.heap.MemoryPoolExtra(Connection, .{ .growable = false });
 
-    buffers: ByteArrayPool,
+    recv_buffers: ByteArrayPool,
+    send_buffers: ByteArrayPool,
+
     connections: Pool,
 
-    fn init(gpa: std.mem.Allocator, max_connections: u32) !ConnectionPool {
-        const pool = try Pool.initPreheated(gpa, max_connections);
-        const buffers = try ByteArrayPool.init(gpa, max_connections * 2, 4096);
+    fn init(
+        gpa: std.mem.Allocator,
+        connections_max: u32,
+        recv_size: u64,
+        send_size: u64,
+    ) !ConnectionPool {
+        const pool = try Pool.initPreheated(gpa, connections_max);
+        const recv_buffers = try ByteArrayPool.init(gpa, connections_max, recv_size);
+        const send_buffers = try ByteArrayPool.init(gpa, connections_max, send_size);
 
         return .{
-            .buffers = buffers,
+            .recv_buffers = recv_buffers,
+            .send_buffers = send_buffers,
             .connections = pool,
         };
     }
 
     fn deinit(pool: *ConnectionPool) void {
-        pool.buffers.deinit();
+        pool.recv_buffers.deinit();
+        pool.send_buffers.deinit();
+
         pool.connections.deinit();
     }
 
     fn create(pool: *ConnectionPool) !*Connection {
         const connection = try pool.connections.create();
-        const recv = try pool.buffers.reserve();
-        const send = try pool.buffers.reserve();
+        const recv = try pool.recv_buffers.reserve();
+        const send = try pool.send_buffers.reserve();
 
         connection.recv_buffer = recv;
         connection.send_buffer = send;
@@ -111,8 +125,8 @@ const ConnectionPool = struct {
     }
 
     fn destroy(pool: *ConnectionPool, connection: *Connection) void {
-        pool.buffers.release(connection.recv_buffer);
-        pool.buffers.release(connection.send_buffer);
+        pool.recv_buffers.release(connection.recv_buffer);
+        pool.send_buffers.release(connection.send_buffer);
 
         pool.connections.destroy(connection);
     }
@@ -123,21 +137,19 @@ const ConnectionPool = struct {
 /// Server operation is tied pretty closely with the "event loop". While there are certainly
 /// more expressive ways to handle different "kinds" of I/O operations, we're focused on simplicity for now.
 const Server = struct {
-    fba: std.heap.FixedBufferAllocator,
     connections: *ConnectionPool,
-
     completion: Completion,
 
     ring: IO_Uring,
     cqes: [32]linux.io_uring_cqe = undefined,
 
     kv: *Store,
+    runner: *command.Runner,
 
-    fn init(fba: std.heap.FixedBufferAllocator, pool: *ConnectionPool, kv: *Store) !Server {
+    fn init(pool: *ConnectionPool, kv: *Store, runner: *command.Runner) !Server {
         const socket = try listen(PORT);
 
         return Server{
-            .fba = fba,
             .connections = pool,
             .completion = .{ .operation = .{ .accept = .{
                 .socket = socket,
@@ -146,6 +158,7 @@ const Server = struct {
             } } },
             .ring = try IO_Uring.init(IO_URING_ENTIRES, 0),
             .kv = kv,
+            .runner = runner,
         };
     }
 
@@ -257,13 +270,7 @@ const Server = struct {
         // command will "write" to this allocator
         // TODO(nickmonad) handle command failure (OOM or otherwise?)
         var output: Writer = .fixed(connection.send_buffer.data);
-
-        const alloc = server.fba.allocator();
-        defer server.fba.reset();
-
-        // TODO(nickmonad) handle parsing error
-        var cmd = command.parse(alloc, connection.recv_buffer.data[0..read]) catch unreachable;
-        cmd.do(alloc, server.kv, &output) catch unreachable;
+        server.runner.run(connection.recv_buffer.data[0..read], &output) catch unreachable;
 
         connection.completion = .{
             .operation = .{
@@ -310,23 +317,46 @@ pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{ .enable_memory_limit = true }) = .init;
     defer assert(gpa.deinit() == .ok);
 
-    // TODO(nickmonad)
-    // buffer size configuration
-    // max connection configuration
-    const buffer = try gpa.allocator().alloc(u8, 1024 * 1024);
-    defer gpa.allocator().free(buffer);
-    const fba = std.heap.FixedBufferAllocator.init(buffer);
+    // TODO(nickmonad) config via CLI options
+    const config: Config = .{
+        .connections_max = 1000,
+        .key_count = 1000,
+        .key_size_max = 5,
+        .val_size_max = 5,
+        .list_length_max = 5,
+    };
 
-    var pool = try ConnectionPool.init(gpa.allocator(), 10);
+    const allocation = Allocation.from(config);
+
+    var pool = try ConnectionPool.init(
+        gpa.allocator(),
+        config.connections_max,
+        allocation.connection_recv_size,
+        allocation.connection_send_size,
+    );
+
     defer pool.deinit();
 
-    // TODO(nickmonad) config store size
-    var kv = try Store.init(gpa.allocator(), 1024);
+    var kv = try Store.init(
+        gpa.allocator(),
+        config.key_count,
+        config.key_size_max,
+        config.val_size_max,
+        config.list_length_max,
+    );
+
     defer kv.deinit(gpa.allocator());
 
-    // TODO(nickmonad)
-    // handle graceful shutdown from SIGTERM
-    var server = try Server.init(fba, &pool, &kv);
+    config.debug();
+    allocation.debug();
+    kv.debug();
+
+    std.debug.print("total_requested_bytes = {d}\n", .{gpa.total_requested_bytes});
+
+    var runner = try command.Runner.init(gpa.allocator(), config, &kv);
+
+    // TODO(nickmonad) handle graceful shutdown from SIGTERM
+    var server = try Server.init(&pool, &kv, &runner);
     std.debug.print("ready!\n", .{});
     try server.run();
 }
@@ -377,7 +407,7 @@ test "MemoryPoolExtra growable = false" {
 test "ConnectionPool" {
     const alloc = std.testing.allocator;
 
-    var pool = try ConnectionPool.init(alloc, 2);
+    var pool = try ConnectionPool.init(alloc, 2, 1024, 1024);
     defer pool.deinit();
 
     // create (1) and (2)

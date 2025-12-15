@@ -79,25 +79,24 @@ pub const Store = struct {
 
     /// Initialize the Store with a given number of keys.
     /// Space for keys will be allocated, along with space of values.
-    /// Currently, the space allocated for values will be double the amount allocated for keys.
-    /// This is to ensure that the number of _associations_ of key to value can be closer
-    /// to what is configured here as `size`, in the event a handful of keys allocate many
-    /// values as part of a list.
-    pub fn init(gpa: std.mem.Allocator, size: u32) !Store {
-        const num_keys = size;
-        const num_vals = num_keys * 2;
+    pub fn init(
+        gpa: std.mem.Allocator,
+        count: u32,
+        key_size: u64,
+        val_size: u64,
+        list_length_max: u64,
+    ) !Store {
+        const num_keys = count;
+        const num_vals = num_keys * list_length_max;
 
         var map: std.StringHashMapUnmanaged(Value) = .empty;
         try map.ensureTotalCapacity(gpa, num_keys);
 
         // TODO(nickmonad) config
-        const keys = try ByteArrayPool.init(gpa, num_keys, 1024);
-        const values = try ByteArrayPool.init(gpa, num_vals, 1024);
+        const keys = try ByteArrayPool.init(gpa, num_keys, key_size);
+        const values = try ByteArrayPool.init(gpa, num_vals, val_size);
 
         // Create a pool of list items for list values.
-        // In practice, we may get really poor utilization of this allocated space,
-        // if our storage is heavy on single string values. Ideally, our static allocation
-        // could share more space with other data types, but we aren't smart enough for that yet.
         const list_items = try ListItemPool.initPreheated(gpa, num_vals);
 
         return .{
@@ -106,6 +105,10 @@ pub const Store = struct {
             .values = values,
             .list_items = list_items,
         };
+    }
+
+    fn testing(gpa: std.mem.Allocator, count: u32) Store {
+        return Store.init(gpa, count, 1024, 1024, 10) catch unreachable;
     }
 
     pub fn deinit(store: *Store, gpa: std.mem.Allocator) void {
@@ -215,13 +218,10 @@ pub const Store = struct {
 
     // Caller owns allocated memory upon a successful return. If an error occurs during processing,
     // this function will deinit the allocation, using the given allocator.
-    pub fn range(store: *Store, alloc: std.mem.Allocator, key: []const u8, start: isize, stop: isize) error{ OutOfMemory, InvalidDataType }!AllocatedList {
-        var items = AllocatedList.init();
-        errdefer items.deinit(alloc);
-
+    pub fn range(store: *Store, alloc: std.mem.Allocator, items: *std.ArrayList([]const u8), key: []const u8, start: isize, stop: isize) error{ OutOfMemory, InvalidDataType }!void {
         const value = store.get(key);
         if (value == null) {
-            return items;
+            return;
         }
 
         const inner = value.?.inner;
@@ -233,7 +233,7 @@ pub const Store = struct {
 
         const i_start: usize = start: {
             if (start >= list.len) {
-                return items;
+                return;
             }
 
             if (start < 0) {
@@ -275,20 +275,15 @@ pub const Store = struct {
                 const item: *ListItem = @fieldParentPtr("node", node);
                 const copied = try alloc.dupe(u8, item.string.data.slice());
 
-                try items.list.append(alloc, copied);
+                try items.appendBounded(copied);
             }
 
             current = node.next;
             i += 1;
         }
-
-        return items;
     }
 
-    pub fn pop(store: *Store, alloc: std.mem.Allocator, key: []const u8, count: usize) error{ OutOfMemory, InvalidDataType }!AllocatedList {
-        var items = AllocatedList.init();
-        errdefer items.deinit(alloc);
-
+    pub fn pop(store: *Store, alloc: std.mem.Allocator, items: *std.ArrayList([]const u8), key: []const u8, count: usize) error{ OutOfMemory, InvalidDataType }!void {
         const exists = store.map.getPtr(key);
         if (exists) |value| {
             if (!value.inner.is_list()) {
@@ -301,7 +296,7 @@ pub const Store = struct {
 
                     // copy value and append to return list
                     const copied = try alloc.dupe(u8, item.string.data.slice());
-                    try items.list.append(alloc, copied);
+                    try items.appendBounded(copied);
 
                     // deallocate item out from stored list
                     store.values.release(@constCast(item.string.data));
@@ -311,8 +306,6 @@ pub const Store = struct {
                 }
             }
         }
-
-        return items;
     }
 
     pub fn remove(store: *Store, key: []const u8) bool {
@@ -341,7 +334,7 @@ pub const Store = struct {
 test "basic set and get" {
     const alloc = std.testing.allocator;
 
-    var store = try Store.init(alloc, 1);
+    var store: Store = .testing(alloc, 1);
     defer store.deinit(alloc);
 
     try store.set("zig", "test", .{});
@@ -354,7 +347,7 @@ test "basic set and get" {
 test "push, 1 element" {
     const alloc = std.testing.allocator;
 
-    var store = try Store.init(alloc, 2);
+    var store: Store = .testing(alloc, 2);
     defer store.deinit(alloc);
 
     try std.testing.expectEqual(1, try store.push(.right, "new", "test"));
@@ -364,7 +357,7 @@ test "push, 1 element" {
 test "push, multiple elements" {
     const alloc = std.testing.allocator;
 
-    var store = try Store.init(alloc, 10);
+    var store: Store = .testing(alloc, 10);
     defer store.deinit(alloc);
 
     try std.testing.expectEqual(1, try store.push(.right, "just", "testing"));
@@ -383,7 +376,7 @@ test "push, multiple elements" {
 test "pop" {
     const alloc = std.testing.allocator;
 
-    var store = try Store.init(alloc, 10);
+    var store: Store = .testing(alloc, 10);
     defer store.deinit(alloc);
 
     _ = try store.push(.right, "list", "a");

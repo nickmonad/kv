@@ -40,7 +40,7 @@ pub const ByteArrayPool = struct {
     arena: std.heap.ArenaAllocator,
     free: ?*ByteArray = null,
 
-    pub fn init(gpa: std.mem.Allocator, num: u32, data_size: usize) Error!ByteArrayPool {
+    pub fn init(gpa: std.mem.Allocator, num: u64, data_size: usize) Error!ByteArrayPool {
         var arena = std.heap.ArenaAllocator.init(gpa);
         var free: ?*ByteArray = null;
 
