@@ -50,7 +50,6 @@ const Command = union(CommandName) {
     pub fn do(
         command: Command,
         alloc: std.mem.Allocator,
-        copy_capacity: usize,
         kv: *Store,
         out: *Writer,
     ) !void {
@@ -60,21 +59,19 @@ const Command = union(CommandName) {
             .SET => |set| return set.do(out, kv),
             .GET => |get| return get.do(out, kv),
             .RPUSH, .LPUSH => |push| return push.do(out, kv),
-            .LRANGE => |lrange| return lrange.do(alloc, copy_capacity, out, kv),
+            .LRANGE => |lrange| return lrange.do(alloc, out, kv),
             .LLEN => |llen| return llen.do(out, kv),
-            .LPOP => |lpop| return lpop.do(alloc, copy_capacity, out, kv),
+            .LPOP => |lpop| return lpop.do(alloc, out, kv),
         }
     }
 };
 
 pub const Runner = struct {
+    config: Config,
     fba: std.heap.FixedBufferAllocator,
     kv: *Store,
 
-    parse_cap: usize,
-    copy_cap: usize,
-
-    pub fn init(gpa: std.mem.Allocator, config: Config, kv: *Store) !Runner {
+    pub fn init(config: Config, gpa: std.mem.Allocator, kv: *Store) !Runner {
         const L = config.list_length_max;
         const V = config.val_size_max;
 
@@ -83,7 +80,6 @@ pub const Runner = struct {
         const parse_size: u64 = (parse_cap * @sizeOf([]const u8));
 
         // ArrayList([]const u8) pointing to duplicated values
-        const copy_cap = L;
         const copy_size = (L * @sizeOf([]const u8));
         const duplicated_size = (L * V);
 
@@ -92,10 +88,9 @@ pub const Runner = struct {
         const fba = std.heap.FixedBufferAllocator.init(buffer);
 
         return .{
+            .config = config,
             .fba = fba,
             .kv = kv,
-            .parse_cap = parse_cap,
-            .copy_cap = copy_cap,
         };
     }
 
@@ -110,16 +105,25 @@ pub const Runner = struct {
         const alloc = runner.fba.allocator();
 
         // TODO(nickmonad) handle parsing and exec errors
-        var command = try parse(alloc, runner.parse_cap, request);
-        try command.do(alloc, runner.copy_cap, runner.kv, out);
+        var command = try parse(alloc, runner.config, request);
+        try command.do(alloc, runner.kv, out);
     }
 };
 
-// NOTE: Assume buffer holds a single command in RESP array format.
-// Pipelining is technically a thing, but I'm not sure what the format should be...
-// It seems like it should be the "inline command" format (not RESP): https://redis.io/docs/latest/develop/reference/protocol-spec/#inline-commands
-pub fn parse(alloc: std.mem.Allocator, capacity: usize, buf: []const u8) !Command {
+// NOTE: This is not yet suitable for use with a general purpose allocator!
+// You should use an arena allocator or fixed buffer allocator. The parsing state must be kept around
+// after parsing, so commands can reference values in the parsed "raw" command from the buffer.
+// So, we can't deinit the internal iterator... Need to re-think the architecture here a bit.
+// Ideally, some structure holds the parsed command _and_ ParseIterator, so we can call .deinit() on it
+// at the appropriate time (after command execution).
+pub fn parse(alloc: std.mem.Allocator, config: Config, buf: []const u8) !Command {
+    // capacity is the maximum number of items we can parse (largest command)
+    const capacity = (1 + 1 + config.list_length_max);
+
+    // NOTE: This has internal state that is NOT free'd after the successful return of this function.
+    // See note about allocator use above.
     var iter = try ParseIterator.init(alloc, capacity, buf);
+    errdefer iter.deinit(alloc);
 
     // command (first element)
     const cmd_parsed = c: {
@@ -230,6 +234,9 @@ const ParseIterator = struct {
         return iter.parsed.items[current];
     }
 
+    // NOTE: This is the method that complicates using a general purpose allocator.
+    // If we try to .deinit() this ParseIterator prior to execution of a command that relies
+    // on this function, this returned slice would point at invalid memory.
     fn rest(iter: *ParseIterator) []const []const u8 {
         const start = iter.index;
         const end = iter.parsed.items.len;
@@ -361,14 +368,12 @@ const LRANGE = struct {
     fn do(
         cmd: LRANGE,
         alloc: std.mem.Allocator,
-        copy_capacity: usize,
         out: *Writer,
         kv: *Store,
     ) !void {
-        var copied: std.ArrayList([]const u8) = try .initCapacity(alloc, copy_capacity);
+        var copied = try kv.range(alloc, cmd.list, cmd.start, cmd.stop);
         defer copied.deinit(alloc);
 
-        try kv.range(alloc, &copied, cmd.list, cmd.start, cmd.stop);
         return BulkArray.encode(out, copied.items);
     }
 };
@@ -415,14 +420,11 @@ const LPOP = struct {
     fn do(
         cmd: LPOP,
         alloc: std.mem.Allocator,
-        copy_capacity: usize,
         out: *Writer,
         kv: *Store,
     ) !void {
-        var copied: std.ArrayList([]const u8) = try .initCapacity(alloc, copy_capacity);
+        var copied = try kv.pop(alloc, cmd.key, cmd.count);
         defer copied.deinit(alloc);
-
-        try kv.pop(alloc, &copied, cmd.key, cmd.count);
 
         if (copied.items.len == 0) {
             return BulkString.encode(out, "");
@@ -444,10 +446,18 @@ const LPOP = struct {
 // test helper
 // create a BulkArray, assuming the std.testing.allocator (ignoring allocation errors)
 // usage: BA(&.{ "ECHO", "test" })
-// Don't forget to free the returned .str
 fn BA(w: *Writer, elements: []const []const u8) void {
     return BulkArray.encode(w, elements) catch unreachable;
 }
+
+const TEST_PARSE_CAPACITY = 10;
+const TEST_CONFIG = Config{
+    .connections_max = 1,
+    .key_count = 10,
+    .key_size_max = 100,
+    .val_size_max = 100,
+    .list_length_max = 25,
+};
 
 test "splitSequence sanity check" {
     const data = "*2\r\n$5\r\nhello\r\n$3\r\nzig\r\n";
@@ -465,7 +475,7 @@ test "splitSequence sanity check" {
 
 test "ParseIterator" {
     const alloc = std.testing.allocator;
-    var iter = try ParseIterator.init(alloc, "*1\r\n$4\r\nPING\r\n");
+    var iter = try ParseIterator.init(alloc, TEST_PARSE_CAPACITY, "*1\r\n$4\r\nPING\r\n");
     defer iter.deinit(alloc);
 
     try std.testing.expectEqualSlices(u8, "PING", iter.next().?);
@@ -474,7 +484,7 @@ test "ParseIterator" {
 
 test "ParseIterator termination" {
     const alloc = std.testing.allocator;
-    var iter = try ParseIterator.init(alloc, "*1\r\n$4\r\nPING\r\n");
+    var iter = try ParseIterator.init(alloc, TEST_PARSE_CAPACITY, "*1\r\n$4\r\nPING\r\n");
     defer iter.deinit(alloc);
 
     try std.testing.expectEqualSlices(u8, "PING", iter.next().?);
@@ -492,7 +502,7 @@ test "ParseIterator multiple elements" {
 
     BA(&w, &.{ "SET", "test", "zig" });
 
-    var iter = try ParseIterator.init(alloc, w.buffered());
+    var iter = try ParseIterator.init(alloc, TEST_PARSE_CAPACITY, w.buffered());
     defer iter.deinit(alloc);
 
     try std.testing.expectEqualSlices(u8, "SET", iter.next().?);
@@ -505,19 +515,19 @@ test "ParseIterator invalid" {
     const alloc = std.testing.allocator;
     // no need to deinit(), should be done by iterator on failure
 
-    try std.testing.expectEqual(ParseError.InvalidArrayFormat, ParseIterator.init(alloc, "1\r\n$4\r\nPING\r\n"));
-    try std.testing.expectEqual(ParseError.InvalidArrayFormat, ParseIterator.init(alloc, ")1\r\n$4\r\nPING\r\n"));
-    try std.testing.expectEqual(ParseError.InvalidLength, ParseIterator.init(alloc, "*1\r\n$3\r\nPING\r\n"));
-    try std.testing.expectEqual(ParseError.InvalidLength, ParseIterator.init(alloc, "*3\r\n$3\r\nSET\r\n$4\r\ntest\r\n$0\r\nzig\r\n"));
-    try std.testing.expectEqual(ParseError.MissingData, ParseIterator.init(alloc, "*1\r\n$3"));
+    try std.testing.expectEqual(ParseError.InvalidArrayFormat, ParseIterator.init(alloc, TEST_PARSE_CAPACITY, "1\r\n$4\r\nPING\r\n"));
+    try std.testing.expectEqual(ParseError.InvalidArrayFormat, ParseIterator.init(alloc, TEST_PARSE_CAPACITY, ")1\r\n$4\r\nPING\r\n"));
+    try std.testing.expectEqual(ParseError.InvalidLength, ParseIterator.init(alloc, TEST_PARSE_CAPACITY, "*1\r\n$3\r\nPING\r\n"));
+    try std.testing.expectEqual(ParseError.InvalidLength, ParseIterator.init(alloc, TEST_PARSE_CAPACITY, "*3\r\n$3\r\nSET\r\n$4\r\ntest\r\n$0\r\nzig\r\n"));
+    try std.testing.expectEqual(ParseError.MissingData, ParseIterator.init(alloc, TEST_PARSE_CAPACITY, "*1\r\n$3"));
 }
 
 test "parse invalid" {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqual(ParseError.InvalidArrayFormat, parse(alloc, ""));
-    try std.testing.expectEqual(ParseError.InvalidArrayFormat, parse(alloc, "1\r\n$4\r\nPING\r\n"));
-    try std.testing.expectEqual(ParseError.InvalidArrayFormat, parse(alloc, ")1\r\n$4\r\nPING\r\n"));
-    try std.testing.expectEqual(ParseError.UnknownCommand, parse(alloc, "*1\r\n$3\r\nZIG\r\n"));
+    try std.testing.expectEqual(ParseError.InvalidArrayFormat, parse(alloc, TEST_CONFIG, ""));
+    try std.testing.expectEqual(ParseError.InvalidArrayFormat, parse(alloc, TEST_CONFIG, "1\r\n$4\r\nPING\r\n"));
+    try std.testing.expectEqual(ParseError.InvalidArrayFormat, parse(alloc, TEST_CONFIG, ")1\r\n$4\r\nPING\r\n"));
+    try std.testing.expectEqual(ParseError.UnknownCommand, parse(alloc, TEST_CONFIG, "*1\r\n$3\r\nZIG\r\n"));
 }
 
 test "parse PING" {
@@ -529,7 +539,7 @@ test "parse PING" {
     BA(&w, &.{"PING"});
 
     const alloc = arena.allocator();
-    const parsed = try parse(alloc, w.buffered());
+    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.PING);
 }
 
@@ -540,7 +550,7 @@ test "parse ECHO error missing" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{"ECHO"});
 
-    try std.testing.expectError(ParseError.MissingData, parse(alloc, w.buffered()));
+    try std.testing.expectError(ParseError.MissingData, parse(alloc, TEST_CONFIG, w.buffered()));
 }
 
 test "parse ECHO arg" {
@@ -553,7 +563,7 @@ test "parse ECHO arg" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "ECHO", "hello, zig" });
 
-    const parsed = try parse(alloc, w.buffered());
+    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.ECHO);
     try std.testing.expectEqualSlices(u8, "hello, zig", parsed.ECHO.arg);
 }
@@ -565,7 +575,7 @@ test "parse SET error missing" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "SET", "test" });
 
-    try std.testing.expectError(ParseError.MissingData, parse(alloc, w.buffered()));
+    try std.testing.expectError(ParseError.MissingData, parse(alloc, TEST_CONFIG, w.buffered()));
 }
 
 test "parse SET key value" {
@@ -578,7 +588,7 @@ test "parse SET key value" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "SET", "test", "zig" });
 
-    const parsed = try parse(alloc, w.buffered());
+    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.SET);
     try std.testing.expectEqualSlices(u8, "test", parsed.SET.key);
@@ -595,7 +605,7 @@ test "parse SET key value PX expiry" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "SET", "test", "zig", "PX", "100" });
 
-    const parsed = try parse(alloc, w.buffered());
+    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.SET);
     try std.testing.expectEqualSlices(u8, "test", parsed.SET.key);
@@ -613,7 +623,7 @@ test "parse GET" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "GET", "test" });
 
-    const parsed = try parse(alloc, w.buffered());
+    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.GET);
     try std.testing.expectEqualSlices(u8, "test", parsed.GET.key);
@@ -629,13 +639,13 @@ test "parse RPUSH, 1 element" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "RPUSH", "test", "zig" });
 
-    const parsed = try parse(alloc, w.buffered());
+    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.RPUSH);
     try std.testing.expectEqualSlices(u8, "test", parsed.RPUSH.list);
 
-    try std.testing.expectEqual(1, parsed.RPUSH.elements.items.len);
-    try std.testing.expectEqualSlices(u8, "zig", parsed.RPUSH.elements.items[0]);
+    try std.testing.expectEqual(1, parsed.RPUSH.elements.len);
+    try std.testing.expectEqualSlices(u8, "zig", parsed.RPUSH.elements[0]);
 }
 
 test "parse RPUSH, mulitple elements" {
@@ -648,14 +658,14 @@ test "parse RPUSH, mulitple elements" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "RPUSH", "test", "zig", "cool" });
 
-    const parsed = try parse(alloc, w.buffered());
+    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.RPUSH);
     try std.testing.expectEqualSlices(u8, "test", parsed.RPUSH.list);
 
-    try std.testing.expectEqual(2, parsed.RPUSH.elements.items.len);
-    try std.testing.expectEqualSlices(u8, "zig", parsed.RPUSH.elements.items[0]);
-    try std.testing.expectEqualSlices(u8, "cool", parsed.RPUSH.elements.items[1]);
+    try std.testing.expectEqual(2, parsed.RPUSH.elements.len);
+    try std.testing.expectEqualSlices(u8, "zig", parsed.RPUSH.elements[0]);
+    try std.testing.expectEqualSlices(u8, "cool", parsed.RPUSH.elements[1]);
 }
 
 test "parse LPUSH, 1 element" {
@@ -668,13 +678,13 @@ test "parse LPUSH, 1 element" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "LPUSH", "test", "zig" });
 
-    const parsed = try parse(alloc, w.buffered());
+    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LPUSH);
     try std.testing.expectEqualSlices(u8, "test", parsed.LPUSH.list);
 
-    try std.testing.expectEqual(1, parsed.LPUSH.elements.items.len);
-    try std.testing.expectEqualSlices(u8, "zig", parsed.LPUSH.elements.items[0]);
+    try std.testing.expectEqual(1, parsed.LPUSH.elements.len);
+    try std.testing.expectEqualSlices(u8, "zig", parsed.LPUSH.elements[0]);
 }
 
 test "parse LRANGE" {
@@ -687,7 +697,7 @@ test "parse LRANGE" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "LRANGE", "test", "0", "1" });
 
-    const parsed = try parse(alloc, w.buffered());
+    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LRANGE);
     try std.testing.expectEqualSlices(u8, "test", parsed.LRANGE.list);
@@ -705,7 +715,7 @@ test "parse LRANGE negative" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "LRANGE", "test", "10", "-5" });
 
-    const parsed = try parse(alloc, w.buffered());
+    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LRANGE);
     try std.testing.expectEqualSlices(u8, "test", parsed.LRANGE.list);
@@ -723,7 +733,7 @@ test "parse LLEN" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "LLEN", "test" });
 
-    const parsed = try parse(alloc, w.buffered());
+    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LLEN);
     try std.testing.expectEqualSlices(u8, "test", parsed.LLEN.list);
@@ -739,7 +749,7 @@ test "parse LPOP" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "LPOP", "test", "10" });
 
-    const parsed = try parse(alloc, w.buffered());
+    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LPOP);
     try std.testing.expectEqualSlices(u8, "test", parsed.LPOP.key);

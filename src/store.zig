@@ -5,6 +5,8 @@ const byte_array = @import("./byte_array.zig");
 const ByteArray = byte_array.ByteArray;
 const ByteArrayPool = byte_array.ByteArrayPool;
 
+const Config = @import("./config.zig").Config;
+
 /// Direct value type referenced by the internal hash map.
 /// As far as lookups go, this is all the hash map cares about storing.
 /// We call this "Value" so it aligns well with the attributes of
@@ -49,27 +51,14 @@ pub const SetOptions = struct {
     expires_in: ?i64 = null, // milliseconds, type defined by std.time
 };
 
-pub const AllocatedList = struct {
-    list: std.ArrayList([]const u8),
-
-    fn init() AllocatedList {
-        return .{ .list = .empty };
-    }
-
-    pub fn deinit(list: *AllocatedList, alloc: std.mem.Allocator) void {
-        for (list.list.items) |item| {
-            alloc.free(item);
-        }
-
-        list.list.deinit(alloc);
-    }
-};
-
 pub const Store = struct {
     pub const PushDirection = enum { left, right };
 
     const ListItemPool = std.heap.MemoryPoolExtra(ListItem, .{ .growable = false });
 
+    // TODO init with config struct here and use values for allocation of list during range() and pop()
+    // instead of having those take a poniter to already allocated list
+    config: Config,
     map: std.StringHashMapUnmanaged(Value),
 
     keys: ByteArrayPool,
@@ -79,36 +68,27 @@ pub const Store = struct {
 
     /// Initialize the Store with a given number of keys.
     /// Space for keys will be allocated, along with space of values.
-    pub fn init(
-        gpa: std.mem.Allocator,
-        count: u32,
-        key_size: u64,
-        val_size: u64,
-        list_length_max: u64,
-    ) !Store {
-        const num_keys = count;
-        const num_vals = num_keys * list_length_max;
+    pub fn init(config: Config, gpa: std.mem.Allocator) !Store {
+        const num_keys = config.key_count;
+        const num_vals = num_keys * config.list_length_max;
 
         var map: std.StringHashMapUnmanaged(Value) = .empty;
         try map.ensureTotalCapacity(gpa, num_keys);
 
         // TODO(nickmonad) config
-        const keys = try ByteArrayPool.init(gpa, num_keys, key_size);
-        const values = try ByteArrayPool.init(gpa, num_vals, val_size);
+        const keys = try ByteArrayPool.init(gpa, num_keys, config.key_size_max);
+        const values = try ByteArrayPool.init(gpa, num_vals, config.val_size_max);
 
         // Create a pool of list items for list values.
         const list_items = try ListItemPool.initPreheated(gpa, num_vals);
 
         return .{
+            .config = config,
             .map = map,
             .keys = keys,
             .values = values,
             .list_items = list_items,
         };
-    }
-
-    fn testing(gpa: std.mem.Allocator, count: u32) Store {
-        return Store.init(gpa, count, 1024, 1024, 10) catch unreachable;
     }
 
     pub fn deinit(store: *Store, gpa: std.mem.Allocator) void {
@@ -218,10 +198,13 @@ pub const Store = struct {
 
     // Caller owns allocated memory upon a successful return. If an error occurs during processing,
     // this function will deinit the allocation, using the given allocator.
-    pub fn range(store: *Store, alloc: std.mem.Allocator, items: *std.ArrayList([]const u8), key: []const u8, start: isize, stop: isize) error{ OutOfMemory, InvalidDataType }!void {
+    pub fn range(store: *Store, alloc: std.mem.Allocator, key: []const u8, start: isize, stop: isize) error{ OutOfMemory, OutOfRange, InvalidDataType }!std.ArrayList([]const u8) {
+        var items: std.ArrayList([]const u8) = try .initCapacity(alloc, store.config.list_length_max);
+        errdefer items.deinit(alloc);
+
         const value = store.get(key);
         if (value == null) {
-            return;
+            return error.InvalidDataType;
         }
 
         const inner = value.?.inner;
@@ -233,7 +216,7 @@ pub const Store = struct {
 
         const i_start: usize = start: {
             if (start >= list.len) {
-                return;
+                return error.OutOfRange;
             }
 
             if (start < 0) {
@@ -281,9 +264,14 @@ pub const Store = struct {
             current = node.next;
             i += 1;
         }
+
+        return items;
     }
 
-    pub fn pop(store: *Store, alloc: std.mem.Allocator, items: *std.ArrayList([]const u8), key: []const u8, count: usize) error{ OutOfMemory, InvalidDataType }!void {
+    pub fn pop(store: *Store, alloc: std.mem.Allocator, key: []const u8, count: usize) error{ OutOfMemory, InvalidDataType }!std.ArrayList([]const u8) {
+        var items: std.ArrayList([]const u8) = try .initCapacity(alloc, store.config.list_length_max);
+        errdefer items.deinit(alloc);
+
         const exists = store.map.getPtr(key);
         if (exists) |value| {
             if (!value.inner.is_list()) {
@@ -306,6 +294,8 @@ pub const Store = struct {
                 }
             }
         }
+
+        return items;
     }
 
     pub fn remove(store: *Store, key: []const u8) bool {
@@ -334,7 +324,7 @@ pub const Store = struct {
 test "basic set and get" {
     const alloc = std.testing.allocator;
 
-    var store: Store = .testing(alloc, 1);
+    var store = Store.init(.testing(), alloc) catch unreachable;
     defer store.deinit(alloc);
 
     try store.set("zig", "test", .{});
@@ -347,7 +337,7 @@ test "basic set and get" {
 test "push, 1 element" {
     const alloc = std.testing.allocator;
 
-    var store: Store = .testing(alloc, 2);
+    var store = Store.init(.testing(), alloc) catch unreachable;
     defer store.deinit(alloc);
 
     try std.testing.expectEqual(1, try store.push(.right, "new", "test"));
@@ -357,7 +347,7 @@ test "push, 1 element" {
 test "push, multiple elements" {
     const alloc = std.testing.allocator;
 
-    var store: Store = .testing(alloc, 10);
+    var store = Store.init(.testing(), alloc) catch unreachable;
     defer store.deinit(alloc);
 
     try std.testing.expectEqual(1, try store.push(.right, "just", "testing"));
@@ -376,7 +366,7 @@ test "push, multiple elements" {
 test "pop" {
     const alloc = std.testing.allocator;
 
-    var store: Store = .testing(alloc, 10);
+    var store = Store.init(.testing(), alloc) catch unreachable;
     defer store.deinit(alloc);
 
     _ = try store.push(.right, "list", "a");
@@ -384,9 +374,21 @@ test "pop" {
     _ = try store.push(.right, "list", "c");
 
     var items = try store.pop(alloc, "list", 1);
-    defer items.deinit(alloc);
 
-    try std.testing.expectEqual(1, items.list.items.len);
+    defer {
+        // NOTE: There's a duplication of list items in `pop` that need to be free'd...
+        // This isn't a concern at run-time in the current model, since we use a fixed buffer allocator with
+        // static initialization, although we probably need to go back to the notion of a "CopiedList" or something
+        // like that to return from these store methods. That way, the caller knows there's a responsibility to
+        // free the duplicated items, assuming the Store is used in the context of dynamic allocation with a GPA.
+        for (items.items) |duped| {
+            alloc.free(duped);
+        }
+
+        items.deinit(alloc);
+    }
+
+    try std.testing.expectEqual(1, items.items.len);
 
     const value = store.get("list").?;
     try std.testing.expectEqual(2, value.inner.list.len);

@@ -12,7 +12,6 @@ const io_uring_cqe = linux.io_uring_cqe;
 const Writer = std.io.Writer;
 
 const Config = @import("config.zig").Config;
-const Allocation = @import("config.zig").Allocation;
 
 const byte_array = @import("byte_array.zig");
 const ByteArray = byte_array.ByteArray;
@@ -24,6 +23,37 @@ const Store = store.Store;
 
 const PORT = 6379;
 const IO_URING_ENTIRES = 1024;
+
+pub fn main() !void {
+    var gpa: std.heap.DebugAllocator(.{ .enable_memory_limit = true }) = .init;
+    defer assert(gpa.deinit() == .ok);
+
+    // TODO(nickmonad) config via CLI options / file
+    const config: Config = .{
+        .connections_max = 1000,
+        .key_count = 1000,
+        .key_size_max = 1024,
+        .val_size_max = 4096,
+        .list_length_max = 50,
+    };
+
+    var pool = try ConnectionPool.init(config, gpa.allocator());
+    defer pool.deinit();
+
+    var kv = try Store.init(config, gpa.allocator());
+    defer kv.deinit(gpa.allocator());
+
+    config.debug();
+    kv.debug();
+
+    var runner = try command.Runner.init(config, gpa.allocator(), &kv);
+
+    // TODO(nickmonad) handle graceful shutdown from SIGTERM
+    var server = try Server.init(&pool, &kv, &runner);
+    std.debug.print("total_requested_bytes = {d}\n", .{gpa.total_requested_bytes});
+    std.debug.print("ready!\n", .{});
+    try server.run();
+}
 
 const Connection = struct {
     completion: Completion = undefined,
@@ -90,14 +120,16 @@ const ConnectionPool = struct {
     connections: Pool,
 
     fn init(
+        config: Config,
         gpa: std.mem.Allocator,
-        connections_max: u32,
-        recv_size: u64,
-        send_size: u64,
     ) !ConnectionPool {
-        const pool = try Pool.initPreheated(gpa, connections_max);
-        const recv_buffers = try ByteArrayPool.init(gpa, connections_max, recv_size);
-        const send_buffers = try ByteArrayPool.init(gpa, connections_max, send_size);
+        const allocation = config.allocation();
+        const recv_size = allocation.connection_recv_size;
+        const send_size = allocation.connection_send_size;
+
+        const pool = try Pool.initPreheated(gpa, config.connections_max);
+        const recv_buffers = try ByteArrayPool.init(gpa, config.connections_max, recv_size);
+        const send_buffers = try ByteArrayPool.init(gpa, config.connections_max, send_size);
 
         return .{
             .recv_buffers = recv_buffers,
@@ -313,54 +345,6 @@ const Server = struct {
     }
 };
 
-pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{ .enable_memory_limit = true }) = .init;
-    defer assert(gpa.deinit() == .ok);
-
-    // TODO(nickmonad) config via CLI options
-    const config: Config = .{
-        .connections_max = 1000,
-        .key_count = 1000,
-        .key_size_max = 5,
-        .val_size_max = 5,
-        .list_length_max = 5,
-    };
-
-    const allocation = Allocation.from(config);
-
-    var pool = try ConnectionPool.init(
-        gpa.allocator(),
-        config.connections_max,
-        allocation.connection_recv_size,
-        allocation.connection_send_size,
-    );
-
-    defer pool.deinit();
-
-    var kv = try Store.init(
-        gpa.allocator(),
-        config.key_count,
-        config.key_size_max,
-        config.val_size_max,
-        config.list_length_max,
-    );
-
-    defer kv.deinit(gpa.allocator());
-
-    config.debug();
-    allocation.debug();
-    kv.debug();
-
-    std.debug.print("total_requested_bytes = {d}\n", .{gpa.total_requested_bytes});
-
-    var runner = try command.Runner.init(gpa.allocator(), config, &kv);
-
-    // TODO(nickmonad) handle graceful shutdown from SIGTERM
-    var server = try Server.init(&pool, &kv, &runner);
-    std.debug.print("ready!\n", .{});
-    try server.run();
-}
-
 fn listen(port: u16) !posix.socket_t {
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
     errdefer posix.close(sockfd);
@@ -407,7 +391,15 @@ test "MemoryPoolExtra growable = false" {
 test "ConnectionPool" {
     const alloc = std.testing.allocator;
 
-    var pool = try ConnectionPool.init(alloc, 2, 1024, 1024);
+    const config: Config = .{
+        .connections_max = 2,
+        .key_count = 10,
+        .key_size_max = 100,
+        .val_size_max = 100,
+        .list_length_max = 25,
+    };
+
+    var pool = try ConnectionPool.init(config, alloc);
     defer pool.deinit();
 
     // create (1) and (2)

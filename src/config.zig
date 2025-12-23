@@ -2,6 +2,13 @@ const std = @import("std");
 const log10 = std.math.log10;
 
 pub const Config = struct {
+    /// Allocation is a calculated set of values (in bytes), based on the given configuration.
+    /// This informs static allocation requested at initialization.
+    pub const Allocation = struct {
+        connection_recv_size: u64,
+        connection_send_size: u64,
+    };
+
     /// Maximum number of concurrent connections.
     connections_max: u32,
 
@@ -18,35 +25,7 @@ pub const Config = struct {
     /// The maximum allowable length for a list as a value.
     list_length_max: u32,
 
-    pub fn debug(config: Config) void {
-        const fmt =
-            \\config
-            \\  connections_max = {d}
-            \\  key_count       = {d}
-            \\  key_size_max    = {d}
-            \\  val_size_max    = {d}
-            \\  list_length_max = {d}
-            \\
-        ;
-
-        std.debug.print(fmt, .{
-            config.connections_max,
-            config.key_count,
-            config.key_size_max,
-            config.val_size_max,
-            config.list_length_max,
-        });
-    }
-};
-
-/// Allocation is a calculated set of values (in bytes), based on the given configuration.
-/// This informs static allocation requested at initialization.
-pub const Allocation = struct {
-    connection_recv_size: u64,
-    connection_send_size: usize,
-    working_buffer_size: usize,
-
-    pub fn from(config: Config) Allocation {
+    pub fn allocation(config: Config) Allocation {
         const K = config.key_size_max;
         const V = config.val_size_max;
         const L = config.list_length_max;
@@ -70,40 +49,45 @@ pub const Allocation = struct {
             ("*".len + log10(L) + 1 + "\r\n".len) +
             (L * ("$".len + log10(V) + 1 + "\r\n".len + V + "\r\n".len));
 
-        // working buffer size
-        // The amount of space needed for parsing and executing commands.
-        //
-        // Parsing commands requires allocating a list of []const u8 slices
-        // capable of holding the largest possible command.
-        //
-        // Executing (some) commands requires allocating a list of duplicated values
-        // from the store. We have to duplicate values before writing to the send
-        // buffer in the event there is a delay in sending. The duplicated list
-        // is an ArrayList([]const u8) pointing to the actual duplicated values.
-        const working_buffer_size: u64 =
-            ((1 + 1 + L) * @sizeOf([]const u8)) + // ArrayList([]const u8) of largest possible command
-            (L * @sizeOf([]const u8)) + (L * V); // ArrayList([]const u8) pointing to duplicated values
-
         return .{
             .connection_recv_size = connection_recv_size,
             .connection_send_size = connection_send_size,
-            .working_buffer_size = working_buffer_size,
         };
     }
 
-    pub fn debug(alloc: Allocation) void {
+    pub fn debug(config: Config) void {
+        const alloc = config.allocation();
         const fmt =
+            \\config
+            \\  connections_max = {d}
+            \\  key_count       = {d}
+            \\  key_size_max    = {d}
+            \\  val_size_max    = {d}
+            \\  list_length_max = {d}
             \\allocation
             \\  connection_recv_size = {d}
             \\  connection_send_size = {d}
-            \\  working_buffer_size  = {d}
             \\
         ;
 
         std.debug.print(fmt, .{
+            config.connections_max,
+            config.key_count,
+            config.key_size_max,
+            config.val_size_max,
+            config.list_length_max,
             alloc.connection_recv_size,
             alloc.connection_send_size,
-            alloc.working_buffer_size,
         });
+    }
+
+    pub fn testing() Config {
+        return .{
+            .connections_max = 1,
+            .key_count = 10,
+            .key_size_max = 100,
+            .val_size_max = 100,
+            .list_length_max = 25,
+        };
     }
 };
