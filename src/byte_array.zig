@@ -7,8 +7,7 @@ pub const Error = error{
 };
 
 pub const ByteArray = struct {
-    // internal
-    // use write(), do not set directly!
+    // use write(), if possible!
     data: []u8 = undefined,
 
     // used length of the written content

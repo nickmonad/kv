@@ -105,7 +105,7 @@ pub const Runner = struct {
         const alloc = runner.fba.allocator();
 
         // TODO(nickmonad) handle parsing and exec errors
-        var command = try parse(alloc, runner.config, request);
+        var command = try parse(runner.config, alloc, request);
         try command.do(alloc, runner.kv, out);
     }
 };
@@ -116,7 +116,7 @@ pub const Runner = struct {
 // So, we can't deinit the internal iterator... Need to re-think the architecture here a bit.
 // Ideally, some structure holds the parsed command _and_ ParseIterator, so we can call .deinit() on it
 // at the appropriate time (after command execution).
-pub fn parse(alloc: std.mem.Allocator, config: Config, buf: []const u8) !Command {
+pub fn parse(config: Config, alloc: std.mem.Allocator, buf: []const u8) !Command {
     // capacity is the maximum number of items we can parse (largest command)
     const capacity = (1 + 1 + config.list_length_max);
 
@@ -451,13 +451,6 @@ fn BA(w: *Writer, elements: []const []const u8) void {
 }
 
 const TEST_PARSE_CAPACITY = 10;
-const TEST_CONFIG = Config{
-    .connections_max = 1,
-    .key_count = 10,
-    .key_size_max = 100,
-    .val_size_max = 100,
-    .list_length_max = 25,
-};
 
 test "splitSequence sanity check" {
     const data = "*2\r\n$5\r\nhello\r\n$3\r\nzig\r\n";
@@ -524,10 +517,10 @@ test "ParseIterator invalid" {
 
 test "parse invalid" {
     const alloc = std.testing.allocator;
-    try std.testing.expectEqual(ParseError.InvalidArrayFormat, parse(alloc, TEST_CONFIG, ""));
-    try std.testing.expectEqual(ParseError.InvalidArrayFormat, parse(alloc, TEST_CONFIG, "1\r\n$4\r\nPING\r\n"));
-    try std.testing.expectEqual(ParseError.InvalidArrayFormat, parse(alloc, TEST_CONFIG, ")1\r\n$4\r\nPING\r\n"));
-    try std.testing.expectEqual(ParseError.UnknownCommand, parse(alloc, TEST_CONFIG, "*1\r\n$3\r\nZIG\r\n"));
+    try std.testing.expectEqual(ParseError.InvalidArrayFormat, parse(.testing(), alloc, ""));
+    try std.testing.expectEqual(ParseError.InvalidArrayFormat, parse(.testing(), alloc, "1\r\n$4\r\nPING\r\n"));
+    try std.testing.expectEqual(ParseError.InvalidArrayFormat, parse(.testing(), alloc, ")1\r\n$4\r\nPING\r\n"));
+    try std.testing.expectEqual(ParseError.UnknownCommand, parse(.testing(), alloc, "*1\r\n$3\r\nZIG\r\n"));
 }
 
 test "parse PING" {
@@ -539,7 +532,7 @@ test "parse PING" {
     BA(&w, &.{"PING"});
 
     const alloc = arena.allocator();
-    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
+    const parsed = try parse(.testing(), alloc, w.buffered());
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.PING);
 }
 
@@ -550,7 +543,7 @@ test "parse ECHO error missing" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{"ECHO"});
 
-    try std.testing.expectError(ParseError.MissingData, parse(alloc, TEST_CONFIG, w.buffered()));
+    try std.testing.expectError(ParseError.MissingData, parse(.testing(), alloc, w.buffered()));
 }
 
 test "parse ECHO arg" {
@@ -563,7 +556,7 @@ test "parse ECHO arg" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "ECHO", "hello, zig" });
 
-    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
+    const parsed = try parse(.testing(), alloc, w.buffered());
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.ECHO);
     try std.testing.expectEqualSlices(u8, "hello, zig", parsed.ECHO.arg);
 }
@@ -575,7 +568,7 @@ test "parse SET error missing" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "SET", "test" });
 
-    try std.testing.expectError(ParseError.MissingData, parse(alloc, TEST_CONFIG, w.buffered()));
+    try std.testing.expectError(ParseError.MissingData, parse(.testing(), alloc, w.buffered()));
 }
 
 test "parse SET key value" {
@@ -588,7 +581,7 @@ test "parse SET key value" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "SET", "test", "zig" });
 
-    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
+    const parsed = try parse(.testing(), alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.SET);
     try std.testing.expectEqualSlices(u8, "test", parsed.SET.key);
@@ -605,7 +598,7 @@ test "parse SET key value PX expiry" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "SET", "test", "zig", "PX", "100" });
 
-    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
+    const parsed = try parse(.testing(), alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.SET);
     try std.testing.expectEqualSlices(u8, "test", parsed.SET.key);
@@ -623,7 +616,7 @@ test "parse GET" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "GET", "test" });
 
-    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
+    const parsed = try parse(.testing(), alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.GET);
     try std.testing.expectEqualSlices(u8, "test", parsed.GET.key);
@@ -639,7 +632,7 @@ test "parse RPUSH, 1 element" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "RPUSH", "test", "zig" });
 
-    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
+    const parsed = try parse(.testing(), alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.RPUSH);
     try std.testing.expectEqualSlices(u8, "test", parsed.RPUSH.list);
@@ -658,7 +651,7 @@ test "parse RPUSH, mulitple elements" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "RPUSH", "test", "zig", "cool" });
 
-    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
+    const parsed = try parse(.testing(), alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.RPUSH);
     try std.testing.expectEqualSlices(u8, "test", parsed.RPUSH.list);
@@ -678,7 +671,7 @@ test "parse LPUSH, 1 element" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "LPUSH", "test", "zig" });
 
-    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
+    const parsed = try parse(.testing(), alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LPUSH);
     try std.testing.expectEqualSlices(u8, "test", parsed.LPUSH.list);
@@ -697,7 +690,7 @@ test "parse LRANGE" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "LRANGE", "test", "0", "1" });
 
-    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
+    const parsed = try parse(.testing(), alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LRANGE);
     try std.testing.expectEqualSlices(u8, "test", parsed.LRANGE.list);
@@ -715,7 +708,7 @@ test "parse LRANGE negative" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "LRANGE", "test", "10", "-5" });
 
-    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
+    const parsed = try parse(.testing(), alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LRANGE);
     try std.testing.expectEqualSlices(u8, "test", parsed.LRANGE.list);
@@ -733,7 +726,7 @@ test "parse LLEN" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "LLEN", "test" });
 
-    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
+    const parsed = try parse(.testing(), alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LLEN);
     try std.testing.expectEqualSlices(u8, "test", parsed.LLEN.list);
@@ -749,7 +742,7 @@ test "parse LPOP" {
     var w: Writer = .fixed(&buf);
     BA(&w, &.{ "LPOP", "test", "10" });
 
-    const parsed = try parse(alloc, TEST_CONFIG, w.buffered());
+    const parsed = try parse(.testing(), alloc, w.buffered());
 
     try std.testing.expect(std.meta.activeTag(parsed) == CommandName.LPOP);
     try std.testing.expectEqualSlices(u8, "test", parsed.LPOP.key);
