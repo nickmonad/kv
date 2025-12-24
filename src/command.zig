@@ -75,15 +75,16 @@ pub const Runner = struct {
         const L = config.list_length_max;
         const V = config.val_size_max;
 
-        // ArrayList([]const u8) of largest possible command
+        // ArrayList([]const u8) of largest possible command.
+        // "[L/R]PUSH list item1 item2 ... itemL"
         const parse_cap = (1 + 1 + L);
-        const parse_size: u64 = (parse_cap * @sizeOf([]const u8));
+        const parse_list: u64 = (parse_cap * @sizeOf([]const u8));
 
-        // ArrayList([]const u8) pointing to duplicated values
-        const copy_size = (L * @sizeOf([]const u8));
-        const duplicated_size = (L * V);
+        // ArrayList([]const u8) pointing to copied/duplicated values.
+        const copy_list = (L * @sizeOf([]const u8));
+        const copy_data = (L * V);
 
-        const fba_size: u64 = parse_size + copy_size + duplicated_size;
+        const fba_size: u64 = parse_list + copy_list + copy_data;
         const buffer = try gpa.alloc(u8, fba_size);
         const fba = std.heap.FixedBufferAllocator.init(buffer);
 
