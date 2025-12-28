@@ -15,7 +15,12 @@ const BulkString = encoding.BulkString;
 const OK = "+OK\r\n";
 const NULL = "$-1\r\n";
 const PONG = "+PONG\r\n";
-const ERROR_WRONGTYPE = "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+
+const ERROR = "-ERR error\r\n";
+const ERROR_WRONGTYPE = "-WRONGTYPE operation against a key holding the wrong kind of value\r\n";
+const ERROR_UNKNOWN_COMMAND = "-ERR unknown command\r\n";
+const ERROR_PARSING = "-ERR parsing error\r\n";
+const ERROR_OOM = "-ERR out of memory, no space available\r\n";
 
 const ParseError = error{
     InvalidArrayFormat,
@@ -99,15 +104,21 @@ pub const Runner = struct {
         gpa.free(runner.fba.buffer);
     }
 
-    pub fn run(runner: *Runner, request: []const u8, out: *Writer) !void {
-        assert(runner.fba.end_index == 0);
-        defer runner.fba.reset();
+    pub fn run(runner: *Runner, request: []const u8, out: *Writer) void {
+        errdefer unreachable;
 
+        defer runner.fba.reset();
         const alloc = runner.fba.allocator();
 
-        // TODO(nickmonad) handle parsing and exec errors
-        var command = try parse(runner.config, alloc, request);
-        try command.do(alloc, runner.kv, out);
+        var command = parse(runner.config, alloc, request) catch |err| switch (err) {
+            ParseError.UnknownCommand => return try out.print(ERROR_UNKNOWN_COMMAND, .{}),
+            else => return try out.print(ERROR_PARSING, .{}),
+        };
+
+        command.do(alloc, runner.kv, out) catch |err| switch (err) {
+            error.OutOfMemory => return try out.print(ERROR_OOM, .{}),
+            else => return try out.print(ERROR, .{}),
+        };
     }
 };
 

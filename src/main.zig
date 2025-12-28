@@ -317,11 +317,8 @@ const Server = struct {
             return;
         }
 
-        // wrap send_buffer in allocator
-        // command will "write" to this allocator
-        // TODO(nickmonad) handle command failure (OOM or otherwise?)
         var output: Writer = .fixed(connection.send_buffer.data);
-        server.runner.run(connection.recv_buffer.data[0..read], &output) catch unreachable;
+        server.runner.run(connection.recv_buffer.data[0..read], &output);
 
         connection.completion = .{
             .operation = .{
