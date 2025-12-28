@@ -56,8 +56,6 @@ pub const Store = struct {
 
     const ListItemPool = std.heap.MemoryPoolExtra(ListItem, .{ .growable = false });
 
-    // TODO init with config struct here and use values for allocation of list during range() and pop()
-    // instead of having those take a poniter to already allocated list
     config: Config,
     map: std.StringHashMapUnmanaged(Value),
 
@@ -75,7 +73,6 @@ pub const Store = struct {
         var map: std.StringHashMapUnmanaged(Value) = .empty;
         try map.ensureTotalCapacity(gpa, num_keys);
 
-        // TODO(nickmonad) config
         const keys = try ByteArrayPool.init(gpa, num_keys, config.key_size_max);
         const values = try ByteArrayPool.init(gpa, num_vals, config.val_size_max);
 

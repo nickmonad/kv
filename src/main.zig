@@ -47,11 +47,11 @@ pub fn main() !void {
     kv.debug();
 
     var runner = try command.Runner.init(config, gpa.allocator(), &kv);
-
-    // TODO(nickmonad) handle graceful shutdown from SIGTERM
     var server = try Server.init(&pool, &kv, &runner);
+
     std.debug.print("total_requested_bytes = {d}\n", .{gpa.total_requested_bytes});
     std.debug.print("ready!\n", .{});
+
     try server.run();
 }
 
@@ -59,8 +59,10 @@ const Connection = struct {
     completion: Completion = undefined,
     client: posix.socket_t = undefined,
 
-    recv_buffer: *ByteArray,
-    send_buffer: *ByteArray,
+    recv_buffer: *ByteArray = undefined,
+    send_buffer: *ByteArray = undefined,
+
+    errored: bool = false,
 
     fn valid(c: *Connection) bool {
         return c.recv_buffer.reserved and c.send_buffer.reserved;
@@ -164,6 +166,11 @@ const ConnectionPool = struct {
     }
 };
 
+/// Used for handling errored connections.
+/// Currently used when the connection pool has no more connections available,
+/// this connection's completion is set to close the incoming client socket.
+var ErrorConnection: Connection = .{ .errored = true };
+
 /// Single-threaded server, with async I/O backed by io_uring.
 /// Inspired partially by TigerBeetle, with some simplification.
 /// Server operation is tied pretty closely with the "event loop". While there are certainly
@@ -251,10 +258,22 @@ const Server = struct {
         assert(server.completion.operation == .accept);
 
         var connection = server.connections.create() catch {
-            // TODO(nickmonad)
-            // use a statically allocated buffer for error response to the client here
-            // also be sure to cleanup the socket resource
-            std.debug.panic("OOM for new connection! need to kick error back to client", .{});
+            // no more connection space is available!
+            // close the connection
+            ErrorConnection.completion = .{
+                .operation = .{
+                    .close = .{ .socket = client },
+                },
+            };
+
+            // TODO enqueue these if no more SQEs are available
+            const close = server.ring.get_sqe() catch unreachable;
+            ErrorConnection.completion.prepare(close);
+
+            const accept = server.ring.get_sqe() catch unreachable;
+            server.completion.prepare(accept);
+
+            return;
         };
 
         assert(connection.valid());
@@ -340,6 +359,11 @@ const Server = struct {
     }
 
     fn on_close(server: *Server, connection: *Connection) void {
+        if (connection.errored) {
+            // nothing to do
+            return;
+        }
+
         assert(connection.valid());
         server.connections.destroy(connection);
     }
@@ -354,7 +378,7 @@ fn listen(port: u16) !posix.socket_t {
     const addr = try net.Address.parseIp4("0.0.0.0", port);
 
     try posix.bind(sockfd, &addr.any, @sizeOf(posix.sockaddr.in));
-    try posix.listen(sockfd, std.math.maxInt(u31)); // TODO: this should probably the same as our max client config
+    try posix.listen(sockfd, std.math.maxInt(u31));
 
     return sockfd;
 }
