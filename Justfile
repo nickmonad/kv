@@ -1,5 +1,5 @@
-flox:
-    flox activate -- fish
+nix:
+    nix-shell --run fish
 
 version:
     #!/usr/bin/env bash
